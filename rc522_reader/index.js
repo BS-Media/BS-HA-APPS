@@ -7,20 +7,28 @@
  * - Events per MQTT publishen:
  *     <topic_base>/present  { event:"present", uid:"...", ts:<ms since epoch> }
  *     <topic_base>/removed  { event:"removed", uid:"...", ts:<ms since epoch> }
+ * - Zusätzlich ein "State"-Topic publishen:
+ *     <topic_base>/state    { present:true/false, uid:"..."|null, ts:<ms> }
  *
  * Wichtige Idee:
- * - "present" wird nur beim Wechsel auf eine *neue* UID gesendet (kein Spam pro Poll).
+ * - "present" wird nur beim Wechsel auf eine neue UID gesendet (kein Spam pro Poll).
  * - "removed" wird gesendet, wenn für eine gewisse Zeit kein Tag mehr erkannt wurde.
  */
 
-const fs = require("fs");                       // ähnlich wie: import fs from "fs"
-const mqtt = require("mqtt");                   // wie: import mqtt from "mqtt"
-const { MFRC522 } = require("./lib/mfrc522");   // wie: from lib.mfrc522 import MFRC522
+/**
+ * Imports (Node.js):
+ * - fs: Dateisystem (wir lesen /data/options.json)
+ * - mqtt: MQTT-Client (publish/subscribe)
+ * - MFRC522: Treiberlogik für den RC522 (spricht intern über spi-device mit /dev/spidevX.Y)
+ */
+const fs = require("fs");
+const mqtt = require("mqtt");
+const { MFRC522 } = require("./lib/mfrc522");
 
-// Home Assistant legt die Add-on-Optionen hier ab (aus der UI-Konfiguration)
+// Home Assistant schreibt Add-on-Optionen aus der UI nach /data/options.json
 const OPT_PATH = "/data/options.json";
 
-/** Optionen laden (MQTT-Host/User/Pass, SPI bus/device, Poll-Interval usw.) */
+/** Optionen laden (MQTT Host/User/Pass, topic_base, SPI bus/device, poll_ms, removed_ms, ...) */
 function loadOptions() {
   const raw = fs.readFileSync(OPT_PATH, "utf8");
   return JSON.parse(raw);
@@ -35,18 +43,17 @@ function sleep(ms) {
   // 1) Konfiguration einlesen
   const o = loadOptions();
 
-  // topic_base ohne abschließende "/" normalisieren
+  // topic_base ohne abschließende "/" normalisieren (damit Topics sauber sind)
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
 
   // 2) MQTT verbinden
-  // Beispiel-URL: mqtt://core-mosquitto:1883
+  // Beispiel: mqtt://core-mosquitto:1883
   const url = `mqtt://${o.mqtt_host}:${Number(o.mqtt_port || 1883)}`;
 
   const client = mqtt.connect(url, {
-    // falls leer, dann undefined (MQTT lib behandelt das sauber)
+    // Wenn leer, undefined übergeben -> mqtt lib lässt es weg
     username: o.mqtt_username || undefined,
     password: o.mqtt_password || undefined,
-    // reconnect macht mqtt lib intern; default ist ok, hier keine Extramagie
   });
 
   client.on("connect", () => {
@@ -63,7 +70,7 @@ function sleep(ms) {
   const r = new MFRC522({
     bus: Number(o.spi_bus ?? 0),
     device: Number(o.spi_device ?? 0),
-    speedHz: 1_000_000, // 1 MHz ist konservativ und stabil
+    speedHz: 1_000_000, // 1 MHz: konservativ/stabil
   });
 
   r.open();       // SPI device öffnen
@@ -83,17 +90,25 @@ function sleep(ms) {
     try {
       const now = Date.now();
 
-      // requestA() = "ist ein Tag da?" (ATQA zurück oder null)
+      // requestA() = "ist ein Tag da?" -> ATQA zurück oder null
       const atqa = await r.requestA();
 
       // --- Kein Tag im Feld ---
       if (!atqa) {
         // Wenn vorher ein Tag da war und lange genug weg ist -> removed senden
         if (presentUid && now - lastSeen >= removedMs) {
+          // Event: Tag wurde entfernt
           client.publish(
             `${topicBase}/removed`,
             JSON.stringify({ event: "removed", uid: presentUid, ts: now })
           );
+
+          // State: aktuell kein Tag präsent (UID wird geleert)
+          client.publish(
+            `${topicBase}/state`,
+            JSON.stringify({ present: false, uid: null, ts: now })
+          );
+
           presentUid = null;
         }
 
@@ -118,9 +133,16 @@ function sleep(ms) {
       if (uid !== presentUid) {
         presentUid = uid;
 
+        // Event: neuer Tag erkannt
         client.publish(
           `${topicBase}/present`,
           JSON.stringify({ event: "present", uid, ts: now })
+        );
+
+        // State: Tag ist aktuell präsent + welche UID
+        client.publish(
+          `${topicBase}/state`,
+          JSON.stringify({ present: true, uid, ts: now })
         );
 
         console.log("PRESENT", uid);
