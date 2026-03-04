@@ -3,6 +3,7 @@
 // Includes: REQA, ANTICOLL CL1 (FIFO read fix), SELECT CL1, AUTH KeyA, READ, WRITE (2-phase ACK).
 
 // aus: https://github.com/marcschweitzer/node-red-contrib-raspi5-rc522
+// und: https://flows.nodered.org/node/node-red-contrib-raspi5-rc522
 
 const spi = require("spi-device");
 
