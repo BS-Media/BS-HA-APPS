@@ -1,6 +1,6 @@
 name: "RC522 Reader"
 description: "Reads RC522 via SPI and publishes UID to MQTT"
-version: "0.2.2"
+version: "0.2.3"
 slug: "rc522_reader"
 init: false
 startup: services
