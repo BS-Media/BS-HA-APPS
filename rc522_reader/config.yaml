@@ -10,6 +10,8 @@ arch:
 devices:
   - /dev/spidev0.0
   - /dev/spidev0.1
+  - /dev/spidev1.0
+  - /dev/spidev1.1
 
 options:
   mqtt_host: "core-mosquitto"
