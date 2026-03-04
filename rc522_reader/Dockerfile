@@ -3,11 +3,11 @@ FROM $BUILD_FROM
 
 RUN apk add --no-cache \
   nodejs npm \
-  python3 make g++ linux-headers
+  python3 build-base linux-headers
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY lib ./lib
 COPY index.js ./index.js
