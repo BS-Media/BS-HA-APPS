@@ -1,16 +1,13 @@
-// lib/mfrc522.js
-// Pure JS MFRC522 (RC522) für Raspberry Pi via spi-device.
-//
 // Was wurde geändert (und warum):
-//   1. onoff importiert       → damit wir GPIO-Pins steuern können (RST-Pin)
+//   1. fs importiert          → für direkten /dev/gpiomem Zugriff (GPIO Reset)
 //   2. speedHz = 100_000      → 100 kHz statt 1 MHz, Clone-Module sind sonst überfordert
 //   3. rstPin gespeichert     → kommt aus index.js, der ihn aus der HA-Config liest
-//   4. hardwareReset()        → zieht RST-Pin kurz auf LOW, startet Chip sauber neu
+//   4. hardwareReset()        → zieht RST-Pin kurz auf LOW via /dev/gpiomem
 //   5. softReset delay 150ms  → Clone brauchen länger als Original-Chips
 //   6. Sanity-Check in init() → prüft ob SPI überhaupt funktioniert, klare Fehlermeldung
 
 const spi = require("spi-device");
-const { Gpio } = require("onoff"); // NEU: für GPIO RST-Pin
+const fs  = require("fs"); // ← neu: für /dev/gpiomem
 
 // ---------- MFRC522 Befehle ----------
 const PCD_IDLE       = 0x00;
@@ -151,29 +148,64 @@ class MFRC522 {
   async fifoFlush() { await this.writeReg(FIFOLevelReg, FIFO_FLUSH_MASK); }
   async fifoLevel() { return await this.readReg(FIFOLevelReg); }
 
-  // NEU: Hardware-Reset über GPIO RST-Pin
-  // Warum: Clone-Module starten ohne Hardware-Reset oft in einem undefinierten
-  //        Zustand und antworten gar nicht auf SPI → ErrorReg=0xff
-  // Was passiert: RST-Pin HIGH → kurz LOW (= Reset) → wieder HIGH (= normal)
-  async hardwareReset() {
-    let gpio;
-    try {
-      gpio = new Gpio(this.rstPin, "out"); // Pin als Ausgang konfigurieren
-      gpio.writeSync(1);  // HIGH — Normalzustand
-      await sleep(10);
-      gpio.writeSync(0);  // LOW  — Reset auslösen
-      await sleep(10);
-      gpio.writeSync(1);  // HIGH — Reset beenden, Chip fährt hoch
-      await sleep(50);    // warten bis Chip bereit ist
-      console.log(`RC522: Hardware-Reset GPIO ${this.rstPin} OK`);
-    } catch (e) {
-      console.warn(`RC522: GPIO Reset fehlgeschlagen (GPIO ${this.rstPin}):`, e.message);
-    } finally {
-      // finally = wird IMMER ausgeführt, egal ob Fehler oder nicht
-      // Wichtig: Pin muss freigegeben werden sonst ist er blockiert
-      if (gpio) gpio.unexport();
-    }
+// Hardware-Reset über direkten /dev/gpiomem Zugriff
+// (funktioniert auf HAOS wo /sys/class/gpio gesperrt ist)
+async hardwareReset() {
+  const GPIO_BASE_OFFSET = 0;        // gpiomem startet direkt beim GPIO-Controller
+  const GPFSEL2 = 2;                 // Register für GPIO 20-29 (Pin 25 liegt hier)
+  const GPSET0  = 7;                 // Register: Pin auf HIGH setzen
+  const GPCLR0  = 10;                // Register: Pin auf LOW setzen
+
+  let fd;
+  try {
+    // /dev/gpiomem öffnen — das ist unser direkter Draht zum GPIO-Controller
+    fd = fs.openSync("/dev/gpiomem", "r+");
+
+    // Den Speicher als 32-bit Integer Buffer einlesen (je 4 Bytes = 1 Register)
+    const mem = Buffer.alloc(4 * 64);
+    fs.readSync(fd, mem, 0, mem.length, GPIO_BASE_OFFSET);
+
+    // Pin 25 als OUTPUT konfigurieren
+    // GPFSEL2 steuert Pins 20-29, je 3 Bits pro Pin
+    // Pin 25 → Bits 15-17 in GPFSEL2
+    const fselOffset = GPFSEL2 * 4;
+    let fsel = mem.readUInt32LE(fselOffset);
+    fsel &= ~(0b111 << 15);  // Bits 15-17 löschen
+    fsel |=  (0b001 << 15);  // 001 = OUTPUT
+    mem.writeUInt32LE(fsel, fselOffset);
+    fs.writeSync(fd, mem, fselOffset, 4, fselOffset);
+
+    // Hilfsfunktionen zum Setzen/Löschen des Pins
+    const pinBit = 1 << 25; // Bit 25 in GPSET0/GPCLR0
+
+    const setHigh = () => {
+      const buf = Buffer.alloc(4);
+      buf.writeUInt32LE(pinBit, 0);
+      fs.writeSync(fd, buf, 0, 4, GPSET0 * 4);
+    };
+    const setLow = () => {
+      const buf = Buffer.alloc(4);
+      buf.writeUInt32LE(pinBit, 0);
+      fs.writeSync(fd, buf, 0, 4, GPCLR0 * 4);
+    };
+
+    // Reset-Sequenz: HIGH → LOW → HIGH
+    setHigh();
+    await sleep(10);
+    setLow();   // ← Reset auslösen
+    await sleep(10);
+    setHigh();  // ← Reset beenden
+    await sleep(50);
+
+    console.log(`RC522: Hardware-Reset GPIO ${this.rstPin} OK`);
+
+  } catch (e) {
+    console.warn(`RC522: GPIO Reset fehlgeschlagen:`, e.message);
+    console.warn(`RC522: Starte ohne Hardware-Reset weiter...`);
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
   }
+}
 
   // Software-Reset: schickt Reset-Befehl über SPI an den Chip
   // GEÄNDERT: 150ms statt 50ms — Clone brauchen mehr Zeit
