@@ -39,9 +39,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-(async () => {
-  // 1) Konfiguration einlesen
-  const o = loadOptions();
+  (async () => {
+    // 1) Konfiguration einlesen
+    const o = loadOptions();
+
+  const spiPath = String(o.spi_path || "").trim();
+
+  let spiBus = Number(o.spi_bus ?? 0);
+  let spiDevice = Number(o.spi_device ?? 0);
+
+  if (spiPath) {
+    const match = spiPath.match(/^\/dev\/spidev(\d+)\.(\d+)$/);
+    if (!match) {
+      throw new Error(`Ungültiger spi_path: ${spiPath}`);
+    }
+    spiBus = Number(match[1]);
+    spiDevice = Number(match[2]);
+  }
 
   // topic_base ohne abschließende "/" normalisieren (damit Topics sauber sind)
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
@@ -64,18 +78,18 @@ function sleep(ms) {
     console.error("MQTT error:", e?.message || e);
   });
 
-  // 3) RC522 initialisieren
-  // bus/device -> /dev/spidev<bus>.<device>
-  // bus=0, device=0 => /dev/spidev0.0 (CE0)
+// 3) RC522 initialisieren
+// Wenn spi_path gesetzt ist, werden bus/device daraus extrahiert.
+// Sonst werden spi_bus und spi_device direkt verwendet.
   const r = new MFRC522({
-    bus: Number(o.spi_bus ?? 0),
-    device: Number(o.spi_device ?? 0),
+    bus: spiBus,
+    device: spiDevice,
     speedHz: 1_000_000, // 1 MHz: konservativ/stabil
   });
 
   r.open();       // SPI device öffnen
   await r.init(); // RC522 Register/Timer/Modus setzen + Antenne an
-  console.log("RC522 ready on SPI", o.spi_bus, "device", o.spi_device);
+  console.log("RC522 ready on", spiPath || `/dev/spidev${spiBus}.${spiDevice}`);
 
   // 4) Timing-Parameter (mit unteren Grenzen, damit man sich nicht totkonfiguriert)
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));        // wie oft nach Tag schauen
