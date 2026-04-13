@@ -1,6 +1,6 @@
 name: "RC522 Reader"
 description: "Reads RC522 via SPI and publishes UID to MQTT"
-version: "0.2.4"
+version: "0.2.5"
 slug: "rc522_reader"
 init: false
 startup: services
@@ -22,8 +22,8 @@ options:
   mqtt_username: ""
   mqtt_password: ""
   topic_base: "rfid/rc522"
-  spi_path: "/dev/spidev10.0"
-  spi_bus: 0
+  spi_path: ""
+  spi_bus: 10
   spi_device: 0
   poll_ms: 200
   removed_ms: 800
