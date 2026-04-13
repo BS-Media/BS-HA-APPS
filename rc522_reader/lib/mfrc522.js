@@ -159,7 +159,7 @@ async hardwareReset() {
   let fd;
   try {
     // /dev/gpiomem öffnen — das ist unser direkter Draht zum GPIO-Controller
-    fd = fs.openSync("/dev/gpiomem", "r+");
+    fd = fs.openSync("/dev/gpiomem0", "r+");
 
     // Den Speicher als 32-bit Integer Buffer einlesen (je 4 Bytes = 1 Register)
     const mem = Buffer.alloc(4 * 64);

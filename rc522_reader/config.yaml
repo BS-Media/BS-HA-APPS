@@ -1,6 +1,6 @@
 name: "RC522 Reader"
 description: "Reads RC522 via SPI and publishes UID to MQTT"
-version: "0.2.7"
+version: "0.2.8"
 slug: "rc522_reader"
 init: false
 startup: services
@@ -15,7 +15,7 @@ devices:
   - /dev/spidev1.1
   - /dev/spidev10.0
   - /dev/spidev10.1
-  - /dev/gpiomem       # ← v 0.2.6 neu: für GPIO/onoff
+  - /dev/gpiomem0    # ← war gpiomem, jetzt gpiomem0 (Pi 5!)
 
 options:
   mqtt_host: "core-mosquitto"
