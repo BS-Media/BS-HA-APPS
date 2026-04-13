@@ -82,14 +82,20 @@ function sleep(ms) {
 // Wenn spi_path gesetzt ist, werden bus/device daraus extrahiert.
 // Sonst werden spi_bus und spi_device direkt verwendet.
   const r = new MFRC522({
-    bus: spiBus,
-    device: spiDevice,
-    speedHz: 1_000_000, // 1 MHz: konservativ/stabil
+      bus: spiBus,
+      device: spiDevice,
+      rstPin: Number(o.rst_pin ?? 25),  // ← liest aus HA Config, Default 25
   });
 
-  r.open();       // SPI device öffnen
-  await r.init(); // RC522 Register/Timer/Modus setzen + Antenne an
-  console.log("RC522 ready on", spiPath || `/dev/spidev${spiBus}.${spiDevice}`);
+  r.open();
+  try {
+      await r.init();
+  } catch (e) {
+      console.error("FEHLER beim Start:", e.message);
+      console.error("App wird beendet. Bitte Verkabelung prüfen und Addon neu starten.");
+      process.exit(1); // sauber beenden statt crashen
+  }
+  console.log(`RC522 ready — SPI: /dev/spidev${spiBus}.${spiDevice}, RST: GPIO ${Number(o.rst_pin ?? 25)}, Speed: ${r.speedHz / 1000} kHz`);
 
   // 4) Timing-Parameter (mit unteren Grenzen, damit man sich nicht totkonfiguriert)
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));        // wie oft nach Tag schauen
