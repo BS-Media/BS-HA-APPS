@@ -1,10 +1,9 @@
 // Was wurde geändert (und warum):
-//   1. fs importiert          → für direkten /dev/gpiomem Zugriff (GPIO Reset)
+//   1. fs importiert          → für direkten /dev/gpiomem0 Zugriff (GPIO Reset)
 //   2. speedHz = 100_000      → 100 kHz statt 1 MHz, Clone-Module sind sonst überfordert
-//   3. rstPin gespeichert     → kommt aus index.js, der ihn aus der HA-Config liest
-//   4. hardwareReset()        → zieht RST-Pin kurz auf LOW via /dev/gpiomem
-//   5. softReset delay 150ms  → Clone brauchen länger als Original-Chips
-//   6. Sanity-Check in init() → prüft ob SPI überhaupt funktioniert, klare Fehlermeldung
+//   3. hardwareReset()        → zieht RST GPIO 25 kurz auf LOW via /dev/gpiomem0
+//   4. softReset delay 150ms  → Clone brauchen länger als Original-Chips
+//   5. Sanity-Check in init() → prüft ob SPI überhaupt funktioniert, klare Fehlermeldung
 
 const spi = require("spi-device");
 const fs  = require("fs"); // ← neu: für /dev/gpiomem
@@ -80,13 +79,13 @@ function ensure16Bytes(data) {
 
 class MFRC522 {
   constructor(opts) {
-    this.bus     = Number(opts.bus     ?? 1);
+    this.bus     = Number(opts.bus     ?? 0);
     this.device  = Number(opts.device  ?? 0);
-    this.speedHz = Number(opts.speedHz ?? 100_000); // GEÄNDERT: 100 kHz, Clone-sicher
-    this.rstPin  = Number(opts.rstPin  ?? 25);      // NEU: GPIO Reset-Pin
+    this.speedHz = Number(opts.speedHz ?? 100_000); // 100 kHz, Clone-sicher
     this.dev     = null;
+    // RST ist fest auf GPIO 25 verdrahtet
   }
-
+  
   // SPI-Verbindung öffnen
   open() {
     if (this.dev) return;
@@ -197,7 +196,7 @@ async hardwareReset() {
     setHigh();  // ← Reset beenden
     await sleep(50);
 
-    console.log(`RC522: Hardware-Reset GPIO ${this.rstPin} OK`);
+    console.log(`RC522: Hardware-Reset GPIO 25 OK`);
 
   } catch (e) {
     console.warn(`RC522: GPIO Reset fehlgeschlagen:`, e.message);
@@ -235,12 +234,12 @@ async hardwareReset() {
     // Beides bedeutet: Verkabelung prüfen!
     const check = await this.readReg(ModeReg);
     if (check === 0xFF || check === 0x00) {
-      throw new Error(
+        throw new Error(
         `RC522 antwortet nicht! ModeReg=0x${check.toString(16)}\n` +
         `→ Verkabelung prüfen (/dev/spidev${this.bus}.${this.device})\n` +
-        `→ RST-Pin prüfen: GPIO ${this.rstPin}\n` +
+        `→ RST-Pin prüfen: GPIO 25\n` +
         `→ Spannung prüfen: muss 3.3V sein, niemals 5V!`
-      );
+        );
     }
     console.log(`RC522: SPI OK (ModeReg=0x${check.toString(16)})`);
 
