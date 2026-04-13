@@ -78,6 +78,14 @@ function sleep(ms) {
     console.error("MQTT error:", e?.message || e);
   });
 
+  client.on("close", () => {
+    console.warn("MQTT Verbindung getrennt — versuche Reconnect...");
+  });
+
+  client.on("reconnect", () => {
+    console.log("MQTT reconnecting...");
+  });
+
 // 3) RC522 initialisieren
 // Wenn spi_path gesetzt ist, werden bus/device daraus extrahiert.
 // Sonst werden spi_bus und spi_device direkt verwendet.
