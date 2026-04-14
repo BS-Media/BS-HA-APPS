@@ -12,8 +12,9 @@
  * Robustheit:
  * - MQTT: reconnectet automatisch, publiziert nach Reconnect den aktuellen State neu
  * - RC522 Watchdog: nach 10 aufeinanderfolgenden SPI-Fehlern → Neustart
- * - missCount: "removed" erst nach 8 aufeinanderfolgenden Polls ohne sicher lesbaren Tag —
- *              verhindert falsches "removed" bei kurzen Leseaussetzern
+ * - missCount: "removed" erst nach mehreren Polls ohne Tag
+ * - uidFailCount: wenn ein Tag erkannt wird, aber die UID mehrfach hintereinander
+ *   nicht lesbar ist, wird ein Neustart erzwungen
  */
 
 const fs = require("fs");
@@ -50,15 +51,16 @@ function sleep(ms) {
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
 
-  // Wie viele Polls ohne sicher lesbaren Tag bis "removed" gesendet wird
-  // Beispiel: 8 Misses bei 200 ms ≈ 1,6 s
   const maxMissesBeforeRemoved = 8;
+  const maxUidFailsBeforeRestart = 8;
+  const maxErrorsBeforeRestart = 10;
 
   // ── 2) Zustandsvariablen ─────────────────────────────────────────────────
 
-  let presentUid = null; // UID des aktuell bekannten Tags oder null
-  let errorCount = 0;    // aufeinanderfolgende SPI-/Reader-Fehler → Watchdog
-  let missCount = 0;     // aufeinanderfolgende Polls ohne sicher lesbaren Tag
+  let presentUid = null;   // aktuell bekannter Tag oder null
+  let missCount = 0;       // Polls ohne Tag im Feld
+  let uidFailCount = 0;    // Tag im Feld, aber UID nicht lesbar
+  let errorCount = 0;      // echte SPI-/Reader-Fehler
 
   // ── 3) MQTT verbinden ────────────────────────────────────────────────────
 
@@ -98,7 +100,7 @@ function sleep(ms) {
   const r = new MFRC522({
     bus: spiBus,
     device: spiDevice,
-    speedHz: 100_000, // konservativ und stabil mit Clone-Modulen
+    speedHz: 100_000,
   });
 
   r.open();
@@ -121,14 +123,15 @@ function sleep(ms) {
     try {
       const now = Date.now();
 
-      // Fragt den RC522: "Ist irgendetwas im Feld?"
+      // Reader fragt: ist überhaupt etwas im Feld?
       const atqa = await r.requestA();
 
-      // requestA() hat geantwortet → der Reader lebt grundsätzlich
+      // requestA hat geantwortet → SPI/Reader lebt grundsätzlich
       errorCount = 0;
 
       // Kein Tag im Feld
       if (!atqa) {
+        uidFailCount = 0;
         missCount++;
 
         if (presentUid && missCount >= maxMissesBeforeRemoved) {
@@ -143,28 +146,41 @@ function sleep(ms) {
           );
 
           presentUid = null;
+          missCount = 0;
         }
 
         await sleep(pollMs);
         continue;
       }
 
-      // Irgendetwas ist im Feld → UID lesen
+      // Es ist etwas im Feld → nicht als "kein Tag" zählen
+      missCount = 0;
+
+      // UID lesen
       const uid4 = await r.anticollCL1();
 
-      // Tag vermutlich im Feld, UID aber gerade nicht stabil lesbar.
-      // Noch kein Miss zählen, damit wir nicht fälschlich auf "frei" gehen.
+      // Es ist etwas im Feld, aber UID nicht lesbar → problematischer Zwischenzustand
       if (!uid4) {
+        uidFailCount++;
+
+        console.warn(
+          `RC522 UID-Lesung fehlgeschlagen ${uidFailCount}/${maxUidFailsBeforeRestart} auf /dev/spidev${spiBus}.${spiDevice}`
+        );
+
+        if (uidFailCount >= maxUidFailsBeforeRestart) {
+          console.error("RC522 hängt in der UID-Lesung — erzwinge Neustart...");
+          process.exit(1);
+        }
+
         await sleep(pollMs);
         continue;
       }
 
-      // Vollständige erfolgreiche UID-Lesung
+      // Erfolgreiche UID-Lesung
+      uidFailCount = 0;
+
       const uid = MFRC522.uidToHex(uid4);
 
-      missCount = 0;
-
-      // Nur bei UID-Wechsel publishen
       if (uid !== presentUid) {
         presentUid = uid;
 
@@ -184,12 +200,11 @@ function sleep(ms) {
       errorCount++;
 
       console.error(
-        `RC522 loop Fehler ${errorCount}/10 auf /dev/spidev${spiBus}.${spiDevice}:`,
+        `RC522 loop Fehler ${errorCount}/${maxErrorsBeforeRestart} auf /dev/spidev${spiBus}.${spiDevice}:`,
         e?.message || e
       );
 
-      // Nach mehreren echten Reader-/SPI-Fehlern Neustart erzwingen
-      if (errorCount >= 10) {
+      if (errorCount >= maxErrorsBeforeRestart) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
         process.exit(1);
       }
