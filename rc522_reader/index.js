@@ -92,7 +92,8 @@ function sleep(ms) {
   // 5) Zustand merken, um nicht zu spammen
   let presentUid = null; // aktuell anliegende UID (string) oder null
   let lastSeen   = 0;    // Zeit (ms), wann zuletzt ein Tag erkannt wurde
-
+  let errorCount = 0;
+  
   // 6) Hauptloop: Endlos RFID abfragen
   while (true) {
     try {
@@ -124,6 +125,7 @@ function sleep(ms) {
 
       const uid = MFRC522.uidToHex(uid4); // z.B. "8aeda760"
       lastSeen = now;
+      errorCount = 0; // ← neu
 
       // Nur bei UID-Wechsel publishen (kein Spam bei jedem Poll)
       if (uid !== presentUid) {
@@ -137,6 +139,11 @@ function sleep(ms) {
 
     } catch (e) {
       console.error("RC522 loop:", e?.message || e);
+      errorCount++;
+      if (errorCount >= 10) {
+        console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
+        process.exit(1);
+      }
       await sleep(500);
     }
 
