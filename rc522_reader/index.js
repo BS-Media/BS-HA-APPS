@@ -7,8 +7,13 @@
  *
  * Ablauf pro Poll:
  *   1. request(WUPA) → ist eine Karte da?
- *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
- *   3. halt()        → Karte zurück in HALT
+ *   2. readId()      → UID lesen (anticoll, bei Cascade auch CL2)
+ *   3. fertig        → kein halt(), kein antennaReset()
+ *
+ * Karte bleibt nach dem Lesen im READY-Zustand.
+ * WUPA beim nächsten Poll spricht sie dort zuverlässig an.
+ *
+ * Reset (softReset + init) nur bei echten SPI-/Reader-Fehlern.
  */
 
 const fs = require("fs");
@@ -48,10 +53,9 @@ function sleep(ms) {
   const debugMode = Boolean(o.debug ?? false);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
-  const maxUidFailsBeforeReInit = 8;   // Re-Init statt Neustart
+  const maxUidFailsBeforeReInit = 8;
   const maxErrorsBeforeRestart = 10;
-  const antennaResetInterval = 200;
-  const statsLogInterval = 500;         // Alle N Polls Statistik loggen (nur bei debug)
+  const statsLogInterval = 500;
 
   // ── 2) Zustandsvariablen ────────────────────────────────────────────────
 
@@ -93,7 +97,7 @@ function sleep(ms) {
     bus: spiBus,
     device: spiDevice,
     speedHz: 100_000,
-    antennaGain: 0x04,
+    antennaGain: 0x04, // 33 dB
     debug: debugMode,
   });
 
@@ -122,21 +126,11 @@ function sleep(ms) {
       pollCount++;
       if (r._stats) r._stats.polls = pollCount;
 
-      // Periodische Statistik (nur bei debug)
+      // Debug-Statistik
       if (debugMode && (pollCount % statsLogInterval) === 0) {
         console.log(`[STATS] ${r.statsLine()}`);
         await r.dumpState("periodic");
       }
-
-      // TEST 2a: periodischer antennaReset deaktiviert
-      // if (!presentUid && (pollCount % antennaResetInterval) === 0) {
-      //   try {
-      //     const check = await r.readReg(0x11);
-      //     if (check !== 0x00 && check !== 0xFF) {
-      //       await r.antennaReset();
-      //     }
-      //   } catch {}
-      // }
 
       // ── Schritt 1: Ist eine Karte im Feld? ──
       const atqa = await r.request(0x52); // WUPA
@@ -162,16 +156,13 @@ function sleep(ms) {
           console.log("REMOVED", presentUid);
           presentUid = null;
           missCount = 0;
-
-          // TEST 2a: antennaReset AN, halt AUS
-          await r.antennaReset();
         }
 
         await sleep(pollMs);
         continue;
       }
 
-      // ── Schritt 2: UID lesen (CL1, bei Bedarf CL2) ──
+      // ── Schritt 2: UID lesen ──
       missCount = 0;
 
       const idResult = await r.readId();
@@ -181,7 +172,6 @@ function sleep(ms) {
         dbg(`UID-Lesung fehlgeschlagen ${uidFailCount}/${maxUidFailsBeforeReInit}`);
 
         if (uidFailCount >= maxUidFailsBeforeReInit) {
-          // Soft-Reset + Re-Init statt hartem Neustart
           console.warn(
             `RC522: ${maxUidFailsBeforeReInit}x UID-Lesung fehlgeschlagen → Re-Init`
           );
@@ -195,8 +185,6 @@ function sleep(ms) {
           uidFailCount = 0;
         }
 
-        // Kein halt() hier — wir wissen nicht ob die Karte sauber selektiert wurde.
-        // Der nächste WUPA holt sie wieder ab.
         await sleep(pollMs);
         continue;
       }
@@ -220,10 +208,8 @@ function sleep(ms) {
         console.log("PRESENT", uid);
       }
 
-      // ── TEST 2a: halt() AUS, antennaReset() AN ──
-      // if (idResult.selected) {
-      //   await r.halt();
-      // }
+      // Kein halt(), kein antennaReset() — Karte bleibt in READY,
+      // WUPA beim nächsten Poll spricht sie dort zuverlässig an.
 
     } catch (e) {
       errorCount++;
@@ -239,10 +225,11 @@ function sleep(ms) {
 
       if (errorCount >= maxErrorsBeforeRestart) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
-        console.log(`[STATS:FINAL] ${r.statsLine()}`);
+        if (r._stats) console.log(`[STATS:FINAL] ${r.statsLine()}`);
         process.exit(1);
       }
 
+      // Bei wiederholten Fehlern: voller Reset
       if (errorCount >= 3) {
         try {
           console.log("RC522: Versuche Soft-Reset + Re-Init...");

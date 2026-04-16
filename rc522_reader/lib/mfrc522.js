@@ -1,6 +1,10 @@
 // MFRC522 Node.js Treiber
 // Orientiert an pi-rc522 (Python) von ondryaso
 // Angepasst für: Clone-Module, langes Kabel, HAOS ohne RPi.GPIO
+//
+// Wichtig: Kein halt() und kein antennaReset() im Normalpfad.
+// Der Polling-Zyklus ist: request(WUPA) → anticoll → UID lesen → fertig.
+// Reset nur bei echten SPI-/Reader-Fehlern über softReset() + init().
 
 const spi = require("spi-device");
 const fs  = require("fs");
@@ -47,7 +51,7 @@ const TPrescalerReg  = 0x2B;
 const TReloadRegH    = 0x2C;
 const TReloadRegL    = 0x2D;
 
-// Register-Namen für Debug-Ausgabe
+// Register-Namen für Debug
 const REG_NAMES = {
   0x01: "CommandReg", 0x02: "ComIEnReg", 0x04: "ComIrqReg",
   0x05: "DivIrqReg", 0x06: "ErrorReg", 0x08: "Status2Reg",
@@ -87,11 +91,10 @@ class MFRC522 {
     this.bus     = Number(opts.bus     ?? 0);
     this.device  = Number(opts.device  ?? 0);
     this.speedHz = Number(opts.speedHz ?? 100_000);
-    this.antennaGain = Number(opts.antennaGain ?? 0x04);
+    this.antennaGain = Number(opts.antennaGain ?? 0x04); // 33 dB
     this.debug   = Boolean(opts.debug ?? false);
     this.dev     = null;
 
-    // Statistiken für Debug
     this._stats = {
       polls: 0,
       requests: 0,
@@ -100,9 +103,6 @@ class MFRC522 {
       anticolls: 0,
       anticollOk: 0,
       anticollFail: 0,
-      halts: 0,
-      haltCrcOk: 0,
-      haltFallback: 0,
       cardWriteCalls: 0,
       cardWriteErrors: 0,
       cardWriteTimeouts: 0,
@@ -113,14 +113,14 @@ class MFRC522 {
     if (this.debug) console.log("[RC522:DBG]", ...args);
   }
 
-  // Statistiken als einzeiligen String
   statsLine() {
     const s = this._stats;
     return `polls=${s.polls} req=${s.requestOk}/${s.requests} ` +
            `anti=${s.anticollOk}/${s.anticolls} ` +
-           `halt=${s.halts}(crc:${s.haltCrcOk} fb:${s.haltFallback}) ` +
            `cw=${s.cardWriteCalls}(err:${s.cardWriteErrors} to:${s.cardWriteTimeouts})`;
   }
+
+  // ── SPI ──
 
   open() {
     if (this.dev) return;
@@ -135,8 +135,6 @@ class MFRC522 {
     try { this.dev.closeSync(); } catch {}
     this.dev = null;
   }
-
-  // ── Low-Level SPI ──
 
   async _xfer(txBuf) {
     return new Promise((resolve, reject) => {
@@ -186,7 +184,7 @@ class MFRC522 {
     return out;
   }
 
-  // ── Hardware-Reset ──
+  // ── Hardware-Reset (GPIO 25, BCM2835/BCM2711) ──
 
   async hardwareReset() {
     let fd;
@@ -270,7 +268,6 @@ class MFRC522 {
     await this.setAntenna(true);
 
     if (this.debug) {
-      // Register-Dump nach Init
       const regs = [CommandReg, ComIEnReg, ModeReg, TxControlReg, TxASKReg,
                     RFCfgReg, TModeReg, TPrescalerReg, Status2Reg];
       const dump = [];
@@ -282,22 +279,7 @@ class MFRC522 {
     }
   }
 
-  // ── Antenne kurz aus/ein ──
-
-  async antennaReset() {
-    this._dbg("antennaReset start");
-    try {
-      await this.setAntenna(false);
-      await sleep(25);
-      await this.setAntenna(true);
-      await sleep(5);
-      this._dbg("antennaReset OK");
-    } catch (e) {
-      console.warn("antennaReset fehlgeschlagen:", e?.message || e);
-    }
-  }
-
-  // ── Diagnose: wichtigste Register lesen ──
+  // ── Diagnose ──
 
   async dumpState(label) {
     if (!this.debug) return;
@@ -318,7 +300,7 @@ class MFRC522 {
     }
   }
 
-  // ── CRC ──
+  // ── CRC (wie pi-rc522) ──
 
   async calcCrc(data) {
     await this.clearBitmask(DivIrqReg, 0x04);
@@ -332,14 +314,14 @@ class MFRC522 {
       i--;
       if ((n & 0x04) || i <= 0) break;
     }
-    if (i <= 0) this._dbg("calcCrc: Timeout (counter exhausted)");
+    if (i <= 0) this._dbg("calcCrc: Timeout");
 
     const lo = await this.readReg(CRCResultRegL);
     const hi = await this.readReg(CRCResultRegH);
     return [lo, hi];
   }
 
-  // ── cardWrite — 1:1 wie pi-rc522, mit Debug-Logging ──
+  // ── cardWrite (1:1 wie pi-rc522) ──
 
   async cardWrite(command, data) {
     this._stats.cardWriteCalls++;
@@ -373,7 +355,7 @@ class MFRC522 {
       n = await this.readReg(ComIrqReg);
       i--;
       if (i <= 0) break;
-      if (n & 0x01) break; // TimerIRq
+      if (n & 0x01) break;
       if (n & irqWait) break;
     }
 
@@ -381,7 +363,7 @@ class MFRC522 {
 
     if (i <= 0) {
       this._stats.cardWriteTimeouts++;
-      this._dbg(`cardWrite: Counter exhausted (timeout), IRQ=${hex(n)}, data=[${hexArr(data)}]`);
+      this._dbg(`cardWrite: Timeout, IRQ=${hex(n)}, tx=[${hexArr(data)}]`);
     }
 
     if (i > 0) {
@@ -391,7 +373,7 @@ class MFRC522 {
 
         if (n & irqEn & 0x01) {
           error = true;
-          this._dbg(`cardWrite: TimerIRq gesetzt → error, data=[${hexArr(data)}]`);
+          this._dbg(`cardWrite: TimerIRq, tx=[${hexArr(data)}]`);
         }
 
         if (command === PCD_TRANSCEIVE) {
@@ -419,15 +401,14 @@ class MFRC522 {
           `${(errReg & 0x02) ? "Parity " : ""}` +
           `${(errReg & 0x08) ? "Collision " : ""}` +
           `${(errReg & 0x10) ? "BufferOvfl " : ""}` +
-          `), data=[${hexArr(data)}], IRQ=${hex(n)}`
+          `), tx=[${hexArr(data)}]`
         );
       }
     }
 
     this._dbg(
       `cardWrite: cmd=${hex(command)} tx=[${hexArr(data)}] → ` +
-      `error=${error} bits=${backBits} rx=[${hexArr(backData)}] ` +
-      `errReg=${hex(errReg)} loops=${2000 - i}`
+      `err=${error} bits=${backBits} rx=[${hexArr(backData)}] loops=${2000 - i}`
     );
 
     return { error, backData, backBits, errReg };
@@ -435,10 +416,11 @@ class MFRC522 {
 
   // ── PICC Operationen ──
 
+  // request() — fragt ob eine Karte im Feld ist
   async request(reqMode = PICC_REQA) {
     this._stats.requests++;
     await this.writeReg(BitFramingReg, 0x07);
-    const { error, backData, backBits, errReg } = await this.cardWrite(PCD_TRANSCEIVE, [reqMode]);
+    const { error, backData, backBits } = await this.cardWrite(PCD_TRANSCEIVE, [reqMode]);
 
     if (error || backBits !== 0x10) {
       this._stats.requestFail++;
@@ -449,6 +431,7 @@ class MFRC522 {
     return backData;
   }
 
+  // anticoll() — liest UID (4 Bytes + BCC)
   async anticoll(selCode = PICC_SEL_CL1) {
     this._stats.anticolls++;
     await this.writeReg(BitFramingReg, 0x00);
@@ -464,10 +447,7 @@ class MFRC522 {
     for (let i = 0; i < 4; i++) check ^= backData[i];
     if (check !== backData[4]) {
       this._stats.anticollFail++;
-      this._dbg(
-        `anticoll(${hex(selCode)}): BCC falsch! ` +
-        `uid=[${hexArr(backData.slice(0,4))}] bcc=${hex(backData[4])} erwartet=${hex(check)}`
-      );
+      this._dbg(`anticoll(${hex(selCode)}): BCC falsch`);
       return null;
     }
 
@@ -476,6 +456,9 @@ class MFRC522 {
     return backData;
   }
 
+  // selectTag() — selektiert eine Karte (READY → ACTIVE)
+  // Wird im Normalpfad NICHT aufgerufen, nur bei Cascade (7-Byte-UID)
+  // oder wenn man danach Mifare-Blöcke lesen/schreiben will.
   async selectTag(uid5, selCode = PICC_SEL_CL1) {
     const buf = [selCode, PICC_SELECT];
     for (let i = 0; i < 5; i++) buf.push(uid5[i]);
@@ -489,28 +472,24 @@ class MFRC522 {
     return { ok, sak };
   }
 
-  // ── readId: Vollständige UID lesen (CL1 + optional CL2) ──
-  // Macht immer anticoll + selectTag, damit die Karte im ACTIVE-Zustand ist.
-  // Gibt { uid: array, uidHex: string, selected: boolean } zurück oder null.
-  // Wenn selected=true ist, kann der Aufrufer danach sicher halt() aufrufen.
+  // readId() — liest die UID (4 oder 7 Bytes)
+  // Für 4-Byte-UIDs: nur anticoll, kein selectTag.
+  // Karte bleibt in READY — WUPA beim nächsten Poll spricht sie dort an.
+  // Für 7-Byte-UIDs: selectTag für CL1 nötig, dann CL2 anticoll.
   async readId() {
-    // CL1 anticoll
     const uid1 = await this.anticoll(PICC_SEL_CL1);
     if (!uid1) return null;
 
-    // uid1[0] === 0x88 → Cascade Tag → UID ist länger als 4 Bytes
     if (uid1[0] !== 0x88) {
-      // Normale 4-Byte-UID → selectTag, damit Karte in ACTIVE-Zustand geht
-      const sel = await this.selectTag(uid1, PICC_SEL_CL1);
+      // Normale 4-Byte-UID
       return {
         uid: uid1.slice(0, 4),
         uidHex: uid1.slice(0, 4).map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
-        selected: sel.ok,
       };
     }
 
-    // Cascade: CL1 Select nötig, dann CL2 anticoll
-    this._dbg("readId: Cascade erkannt (uid1[0]=0x88), starte CL2...");
+    // Cascade: CL1 Select nötig um CL2 lesen zu können
+    this._dbg("readId: Cascade (uid1[0]=0x88), starte CL2...");
 
     const sel1 = await this.selectTag(uid1, PICC_SEL_CL1);
     if (!sel1.ok) {
@@ -524,36 +503,23 @@ class MFRC522 {
       return null;
     }
 
-    // CL2 Select
-    const sel2 = await this.selectTag(uid2, PICC_SEL_CL2);
-
-    // 7-Byte-UID: uid1[1..3] + uid2[0..3]
     const fullUid = [...uid1.slice(1, 4), ...uid2.slice(0, 4)];
     return {
       uid: fullUid,
       uidHex: fullUid.map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
-      selected: sel2.ok,
     };
   }
 
-  // ── halt() — ISO 14443-3 konform ──
+  // halt() — Karte von ACTIVE nach HALT versetzen
+  // Wird im Normalpfad NICHT aufgerufen.
+  // Nur verfügbar für spezielle Anwendungsfälle (nach selectTag + Mifare-Ops).
   async halt() {
-    this._stats.halts++;
     try {
       const cmd = [PICC_HALT, 0x00];
       const crc = await this.calcCrc(cmd);
       cmd.push(crc[0], crc[1]);
       await this.cardWrite(PCD_TRANSCEIVE, cmd);
-      this._stats.haltCrcOk++;
-      this._dbg("halt: OK (mit CRC)");
-    } catch {
-      // CRC oder Transceive fehlgeschlagen → Fallback ohne CRC
-      this._stats.haltFallback++;
-      this._dbg("halt: CRC fehlgeschlagen, Fallback ohne CRC");
-      try {
-        await this.cardWrite(PCD_TRANSCEIVE, [PICC_HALT, 0x00]);
-      } catch {}
-    }
+    } catch {}
     try {
       await this.clearBitmask(Status2Reg, 0x08);
     } catch {}
@@ -563,7 +529,7 @@ class MFRC522 {
     await this.clearBitmask(Status2Reg, 0x08);
   }
 
-  // ── Mifare Operationen ──
+  // ── Mifare Operationen (benötigen vorheriges selectTag) ──
 
   async mifareAuth(blockAddr, key6, uid4) {
     const buf = [PICC_AUTH_KEY_A, blockAddr];
