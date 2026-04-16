@@ -25,6 +25,28 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ── Prozess-/Crash-Diagnose ───────────────────────────────────────────────
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err?.stack || err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err?.stack || err);
+});
+
+process.on("exit", (code) => {
+  console.error("PROCESS EXIT with code:", code);
+});
+
+process.on("SIGTERM", () => {
+  console.error("PROCESS GOT SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  console.error("PROCESS GOT SIGINT");
+});
+
 (async () => {
   const o = loadOptions();
 
@@ -48,6 +70,7 @@ function sleep(ms) {
   const maxUidFailsBeforeReInit = 8;
   const maxErrorsBeforeRestart = 10;
   const statsLogInterval = 500;
+  const heartbeatInterval = 50;
 
   let presentUid = null;
   let missCount = 0;
@@ -108,11 +131,20 @@ function sleep(ms) {
     `Removed: ${removedMs}ms (${maxMissesBeforeRemoved} misses)`
   );
 
+  console.log("MAIN LOOP START");
+
   while (true) {
     try {
       const now = Date.now();
       pollCount++;
       if (r._stats) r._stats.polls = pollCount;
+
+      if ((pollCount % heartbeatInterval) === 0) {
+        console.log(
+          `HEARTBEAT poll=${pollCount} presentUid=${presentUid} ` +
+          `missCount=${missCount} uidFailCount=${uidFailCount} errorCount=${errorCount}`
+        );
+      }
 
       if (debugMode && (pollCount % statsLogInterval) === 0) {
         console.log(`[STATS] ${r.statsLine()}`);
@@ -205,7 +237,7 @@ function sleep(ms) {
 
       console.error(
         `RC522 loop Fehler ${errorCount}/${maxErrorsBeforeRestart} auf ` +
-        `/dev/spidev${spiBus}.${spiDevice}: ${e?.message || e}`
+        `/dev/spidev${spiBus}.${spiDevice}: ${e?.stack || e?.message || e}`
       );
 
       if (debugMode) {
