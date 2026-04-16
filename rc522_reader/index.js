@@ -128,17 +128,15 @@ function sleep(ms) {
         await r.dumpState("periodic");
       }
 
-      // Periodischer Antenna-Reset wenn lange keine Karte da war
-      if (!presentUid && (pollCount % antennaResetInterval) === 0) {
-        try {
-          const check = await r.readReg(0x11);
-          if (check !== 0x00 && check !== 0xFF) {
-            await r.antennaReset();
-          } else {
-            console.warn(`RC522: ModeReg=${check} bei Antenna-Reset — Chip reagiert nicht richtig`);
-          }
-        } catch {}
-      }
+      // TEST 2a: periodischer antennaReset deaktiviert
+      // if (!presentUid && (pollCount % antennaResetInterval) === 0) {
+      //   try {
+      //     const check = await r.readReg(0x11);
+      //     if (check !== 0x00 && check !== 0xFF) {
+      //       await r.antennaReset();
+      //     }
+      //   } catch {}
+      // }
 
       // ── Schritt 1: Ist eine Karte im Feld? ──
       const atqa = await r.request(0x52); // WUPA
@@ -165,7 +163,8 @@ function sleep(ms) {
           presentUid = null;
           missCount = 0;
 
-          // TEST: kein Reset nach REMOVED — saubere Isolation
+          // TEST 2a: antennaReset AN, halt AUS
+          await r.antennaReset();
         }
 
         await sleep(pollMs);
@@ -221,12 +220,10 @@ function sleep(ms) {
         console.log("PRESENT", uid);
       }
 
-      // ── Schritt 3: Karte in HALT versetzen ──
-      // halt() nur wenn selectTag() erfolgreich war (Karte im ACTIVE-Zustand).
-      // Ohne vorheriges SELECT ist HALT undefiniert und kann Clone-Chips verwirren.
-      if (idResult.selected) {
-        await r.halt();
-      }
+      // ── TEST 2a: halt() AUS, antennaReset() AN ──
+      // if (idResult.selected) {
+      //   await r.halt();
+      // }
 
     } catch (e) {
       errorCount++;
