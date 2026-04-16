@@ -190,22 +190,37 @@ class MFRC522 {
 
   async hardwareReset() {
     try {
-      // LOW für 10 ms, dann HIGH für 50 ms.
-      // -m time sorgt dafür, dass gpioset nach der Haltezeit wieder endet.
-      execSync("gpioset -m time -u 10000 /dev/gpiochip0 25=0", {
+      // libgpiod v2 Syntax
+      // LOW für 10 ms, dann HIGH für 50 ms
+      execSync("gpioset -p 10ms -t0 /dev/gpiochip0 25=0", {
         timeout: 3000,
         stdio: "pipe",
       });
-      execSync("gpioset -m time -u 50000 /dev/gpiochip0 25=1", {
+      execSync("gpioset -p 50ms -t0 /dev/gpiochip0 25=1", {
         timeout: 3000,
         stdio: "pipe",
       });
 
       await sleep(50);
       console.log("RC522: Hardware-Reset GPIO 25 OK");
-    } catch (e) {
-      console.warn("RC522: GPIO Reset fehlgeschlagen:", e?.message || e);
-      console.warn("RC522: Starte ohne Hardware-Reset weiter...");
+    } catch (e1) {
+      try {
+        // Fallback für ältere libgpiod v1 Syntax
+        execSync("gpioset -m time -u 10000 /dev/gpiochip0 25=0", {
+          timeout: 3000,
+          stdio: "pipe",
+        });
+        execSync("gpioset -m time -u 50000 /dev/gpiochip0 25=1", {
+          timeout: 3000,
+          stdio: "pipe",
+        });
+
+        await sleep(50);
+        console.log("RC522: Hardware-Reset GPIO 25 OK (fallback v1)");
+      } catch (e2) {
+        console.warn("RC522: GPIO Reset fehlgeschlagen:", e2?.message || e2);
+        console.warn("RC522: Starte ohne Hardware-Reset weiter...");
+      }
     }
   }
 
