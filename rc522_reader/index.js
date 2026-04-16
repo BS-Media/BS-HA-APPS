@@ -46,9 +46,8 @@ function sleep(ms) {
   const maxUidFailsBeforeRestart = 8;
   const maxErrorsBeforeRestart = 10;
 
-  // NEU: Alle 50 Polls ohne Karte → Antenne kurz resetten
-  // Verhindert, dass das RF-Feld bei langem Kabel "einschläft"
-  const antennaResetInterval = 50;
+  // NEU: Alle 200 Polls ohne Karte → Antenne kurz resetten
+  const antennaResetInterval = 200;
 
   // ── 2) Zustandsvariablen ─────────────────────────────────────────────────
 
@@ -120,9 +119,15 @@ function sleep(ms) {
       const now = Date.now();
 
       // NEU: Periodischer Antenna-Reset wenn lange keine Karte da war
+      // Nur wenn der Chip auch wirklich antwortet (ModeReg-Check)
       pollsSinceAntennaReset++;
       if (!presentUid && pollsSinceAntennaReset >= antennaResetInterval) {
-        await r.antennaReset();
+        try {
+          const check = await r.readReg(0x11); // ModeReg
+          if (check !== 0x00 && check !== 0xFF) {
+            await r.antennaReset();
+          }
+        } catch {}
         pollsSinceAntennaReset = 0;
       }
 
@@ -227,9 +232,18 @@ function sleep(ms) {
         process.exit(1);
       }
 
-      // NEU: Bei SPI-Fehlern Antenne resetten — hilft bei langem Kabel
-      try { await r.antennaReset(); } catch {}
-      pollsSinceAntennaReset = 0;
+      // Bei wiederholten Fehlern: vollen Soft-Reset + Re-Init versuchen
+      if (errorCount >= 3) {
+        try {
+          console.log("RC522: Versuche Soft-Reset + Re-Init...");
+          await r.softReset();
+          await r.init();
+          console.log("RC522: Re-Init erfolgreich");
+          errorCount = 0; // Reset hat geklappt, Zähler zurück
+        } catch (reinitErr) {
+          console.error("RC522: Re-Init fehlgeschlagen:", reinitErr?.message);
+        }
+      }
 
       await sleep(500);
     }

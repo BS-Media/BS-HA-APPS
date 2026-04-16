@@ -151,13 +151,18 @@ class MFRC522 {
   async fifoLevel() { return await this.readReg(FIFOLevelReg); }
 
   // ── NEU: Antenne kurz aus/ein → RF-Feld wird neu aufgebaut ──
-  // Dadurch vergessen alle Karten im Feld ihren Zustand und sind wieder ansprechbar
+  // Benutzt feste Werte statt Read-Modify-Write, damit ein SPI-Glitch
+  // nicht 0xFF ins Register schreibt und den Chip kaputtmacht.
+  // TxControlReg Normalwert nach Init = 0x83 (Tx1RFEn + Tx2RFEn + InvTx2RFOn)
   async antennaReset() {
-    const v = await this.readReg(TxControlReg);
-    await this.writeReg(TxControlReg, v & ~0x03); // Antenne AUS
-    await sleep(50);                                // 50ms reicht für Feld-Abbau
-    await this.writeReg(TxControlReg, v | 0x03);  // Antenne AN
-    await sleep(10);                                // kurz stabilisieren lassen
+    try {
+      await this.writeReg(TxControlReg, 0x80); // Antenne AUS (nur InvTx2RFOn bleibt)
+      await sleep(25);                          // 25ms reicht für Feld-Abbau
+      await this.writeReg(TxControlReg, 0x83); // Antenne AN (bekannter guter Wert)
+      await sleep(5);
+    } catch (e) {
+      console.warn("antennaReset fehlgeschlagen:", e?.message || e);
+    }
   }
 
   // ── NEU: Crypto1-Flag zurücksetzen ──
