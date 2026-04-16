@@ -1,6 +1,6 @@
 name: "RC522 Reader"
 description: "Reads RC522 via SPI and publishes UID to MQTT"
-version: "0.3.7"
+version: "0.4.0"
 slug: "rc522_reader"
 init: false
 startup: services
@@ -26,6 +26,7 @@ options:
   spi_device: 0
   poll_ms: 200
   removed_ms: 800
+  debug: false
 
 schema:
   mqtt_host: str
@@ -38,6 +39,7 @@ schema:
   spi_device: "int(0,1)"
   poll_ms: "int(50,2000)"
   removed_ms: "int(100,5000)"
+  debug: bool
 
 privileged:
   - SYS_RAWIO

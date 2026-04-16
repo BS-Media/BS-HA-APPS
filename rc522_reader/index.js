@@ -1,11 +1,14 @@
 /**
  * RC522 Reader Add-on (Home Assistant)
  *
- * ÄNDERUNGEN gegenüber v0.3.5:
- * - haltA() nach jedem erfolgreichen UID-Lesen → Karte wird deselektiert
- * - antennaReset() bei "removed" → RF-Feld wird neu aufgebaut
- * - Periodischer antennaReset alle N Polls → verhindert "taubes" Feld bei langem Kabel
- * - requestA/anticollCL1 Fehler werden abgefangen statt den Loop zu crashen
+ * Liest RC522/MFRC522 per SPI und publiziert Events per MQTT.
+ * Basierend auf pi-rc522 (ondryaso) — portiert nach Node.js.
+ * Kein IRQ nötig — reiner Polling-Modus.
+ *
+ * Ablauf pro Poll:
+ *   1. request(WUPA) → ist eine Karte da?
+ *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
+ *   3. halt()        → Karte zurück in HALT
  */
 
 const fs = require("fs");
@@ -24,7 +27,7 @@ function sleep(ms) {
 }
 
 (async () => {
-  // ── 1) Konfiguration laden ───────────────────────────────────────────────
+  // ── 1) Konfiguration ────────────────────────────────────────────────────
 
   const o = loadOptions();
 
@@ -40,24 +43,29 @@ function sleep(ms) {
   }
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
-  const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
+  const pollMs    = Math.max(50, Number(o.poll_ms ?? 200));
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 800));
+  const debugMode = Boolean(o.debug ?? false);
 
-  const maxMissesBeforeRemoved = 8;
-  const maxUidFailsBeforeRestart = 8;
+  const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
+  const maxUidFailsBeforeReInit = 8;   // Re-Init statt Neustart
   const maxErrorsBeforeRestart = 10;
-
-  // NEU: Alle 200 Polls ohne Karte → Antenne kurz resetten
   const antennaResetInterval = 200;
+  const statsLogInterval = 500;         // Alle N Polls Statistik loggen (nur bei debug)
 
-  // ── 2) Zustandsvariablen ─────────────────────────────────────────────────
+  // ── 2) Zustandsvariablen ────────────────────────────────────────────────
 
   let presentUid = null;
   let missCount = 0;
   let uidFailCount = 0;
   let errorCount = 0;
-  let pollsSinceAntennaReset = 0; // NEU
+  let pollCount = 0;
 
-  // ── 3) MQTT verbinden ────────────────────────────────────────────────────
+  function dbg(...args) {
+    if (debugMode) console.log("[MAIN:DBG]", ...args);
+  }
+
+  // ── 3) MQTT ─────────────────────────────────────────────────────────────
 
   const url = `mqtt://${o.mqtt_host}:${Number(o.mqtt_port || 1883)}`;
 
@@ -70,32 +78,23 @@ function sleep(ms) {
     console.log("MQTT connected:", url, "topic:", topicBase);
     client.publish(
       `${topicBase}/state`,
-      JSON.stringify({
-        present: presentUid !== null,
-        uid: presentUid,
-        ts: Date.now(),
-      })
+      JSON.stringify({ present: presentUid !== null, uid: presentUid, ts: Date.now() }),
+      { retain: true }
     );
   });
 
-  client.on("error", (e) => {
-    console.error("MQTT error:", e?.message || e);
-  });
+  client.on("error", (e) => console.error("MQTT error:", e?.message || e));
+  client.on("close", () => console.warn("MQTT Verbindung getrennt — Reconnect..."));
+  client.on("reconnect", () => console.log("MQTT reconnecting..."));
 
-  client.on("close", () => {
-    console.warn("MQTT Verbindung getrennt — versuche Reconnect...");
-  });
-
-  client.on("reconnect", () => {
-    console.log("MQTT reconnecting...");
-  });
-
-  // ── 4) RC522 initialisieren ──────────────────────────────────────────────
+  // ── 4) RC522 init ───────────────────────────────────────────────────────
 
   const r = new MFRC522({
     bus: spiBus,
     device: spiDevice,
     speedHz: 100_000,
+    antennaGain: 0x04,
+    debug: debugMode,
   });
 
   r.open();
@@ -109,37 +108,46 @@ function sleep(ms) {
   }
 
   console.log(
-    `RC522 ready — SPI: /dev/spidev${spiBus}.${spiDevice}, RST: GPIO 25, Speed: ${r.speedHz / 1000} kHz`
+    `RC522 ready — SPI: /dev/spidev${spiBus}.${spiDevice}, RST: GPIO 25, ` +
+    `Speed: ${r.speedHz / 1000} kHz, Gain: ${r.antennaGain}, ` +
+    `Debug: ${debugMode}, Poll: ${pollMs}ms, ` +
+    `Removed: ${removedMs}ms (${maxMissesBeforeRemoved} misses)`
   );
 
-  // ── 5) Hauptloop ─────────────────────────────────────────────────────────
+  // ── 5) Hauptloop ────────────────────────────────────────────────────────
 
   while (true) {
     try {
       const now = Date.now();
+      pollCount++;
+      r._stats.polls = pollCount;
 
-      // NEU: Periodischer Antenna-Reset wenn lange keine Karte da war
-      // Nur wenn der Chip auch wirklich antwortet (ModeReg-Check)
-      pollsSinceAntennaReset++;
-      if (!presentUid && pollsSinceAntennaReset >= antennaResetInterval) {
-        try {
-          const check = await r.readReg(0x11); // ModeReg
-          if (check !== 0x00 && check !== 0xFF) {
-            await r.antennaReset();
-          }
-        } catch {}
-        pollsSinceAntennaReset = 0;
+      // Periodische Statistik (nur bei debug)
+      if (debugMode && (pollCount % statsLogInterval) === 0) {
+        console.log(`[STATS] ${r.statsLine()}`);
+        await r.dumpState("periodic");
       }
 
-      // Reader fragt: ist überhaupt etwas im Feld?
-      // Benutzt jetzt WUPA statt REQA → weckt auch gehaltete Karten
-      const atqa = await r.requestA();
+      // Periodischer Antenna-Reset wenn lange keine Karte da war
+      if (!presentUid && (pollCount % antennaResetInterval) === 0) {
+        try {
+          const check = await r.readReg(0x11);
+          if (check !== 0x00 && check !== 0xFF) {
+            await r.antennaReset();
+          } else {
+            console.warn(`RC522: ModeReg=${check} bei Antenna-Reset — Chip reagiert nicht richtig`);
+          }
+        } catch {}
+      }
 
-      // requestA hat geantwortet → SPI/Reader lebt
+      // ── Schritt 1: Ist eine Karte im Feld? ──
+      const atqa = await r.request(0x52); // WUPA
+
+      // SPI lebt → errorCount zurücksetzen
       errorCount = 0;
 
-      // Kein Tag im Feld
       if (!atqa) {
+        // Keine Karte
         uidFailCount = 0;
         missCount++;
 
@@ -148,54 +156,55 @@ function sleep(ms) {
             `${topicBase}/removed`,
             JSON.stringify({ event: "removed", uid: presentUid, ts: now })
           );
-
           client.publish(
             `${topicBase}/state`,
-            JSON.stringify({ present: false, uid: null, ts: now })
+            JSON.stringify({ present: false, uid: null, ts: now }),
+            { retain: true }
           );
-
           console.log("REMOVED", presentUid);
           presentUid = null;
           missCount = 0;
 
-          // NEU: Nach "removed" Antenne resetten → sauberer Neustart des RF-Feldes
           await r.antennaReset();
-          pollsSinceAntennaReset = 0;
         }
 
         await sleep(pollMs);
         continue;
       }
 
-      // Es ist etwas im Feld
+      // ── Schritt 2: UID lesen (CL1, bei Bedarf CL2) ──
       missCount = 0;
-      pollsSinceAntennaReset = 0;
 
-      // UID lesen
-      const uid4 = await r.anticollCL1();
+      const idResult = await r.readId();
 
-      if (!uid4) {
+      if (!idResult) {
         uidFailCount++;
+        dbg(`UID-Lesung fehlgeschlagen ${uidFailCount}/${maxUidFailsBeforeReInit}`);
 
-        console.warn(
-          `RC522 UID-Lesung fehlgeschlagen ${uidFailCount}/${maxUidFailsBeforeRestart} auf /dev/spidev${spiBus}.${spiDevice}`
-        );
-
-        if (uidFailCount >= maxUidFailsBeforeRestart) {
-          console.error("RC522 hängt in der UID-Lesung — erzwinge Neustart...");
-          process.exit(1);
+        if (uidFailCount >= maxUidFailsBeforeReInit) {
+          // Soft-Reset + Re-Init statt hartem Neustart
+          console.warn(
+            `RC522: ${maxUidFailsBeforeReInit}x UID-Lesung fehlgeschlagen → Re-Init`
+          );
+          try {
+            await r.softReset();
+            await r.init();
+            console.log("RC522: Re-Init nach UID-Fehler erfolgreich");
+          } catch (e) {
+            console.error("RC522: Re-Init fehlgeschlagen:", e?.message);
+          }
+          uidFailCount = 0;
         }
 
-        // NEU: haltA versuchen, damit die Karte in einen definierten Zustand geht
-        await r.haltA();
+        // Kein halt() hier — wir wissen nicht ob die Karte sauber selektiert wurde.
+        // Der nächste WUPA holt sie wieder ab.
         await sleep(pollMs);
         continue;
       }
 
-      // Erfolgreiche UID-Lesung
       uidFailCount = 0;
 
-      const uid = MFRC522.uidToHex(uid4);
+      const uid = idResult.uidHex;
 
       if (uid !== presentUid) {
         presentUid = uid;
@@ -204,42 +213,46 @@ function sleep(ms) {
           `${topicBase}/present`,
           JSON.stringify({ event: "present", uid, ts: now })
         );
-
         client.publish(
           `${topicBase}/state`,
-          JSON.stringify({ present: true, uid, ts: now })
+          JSON.stringify({ present: true, uid, ts: now }),
+          { retain: true }
         );
-
         console.log("PRESENT", uid);
       }
 
-      // ── NEU: Karte nach dem Lesen in HALT versetzen ──
-      // Das ist DER zentrale Fix: Ohne haltA bleibt die Karte im ACTIVE-Zustand.
-      // Eine ACTIVE Karte ignoriert REQA/WUPA und wird beim nächsten Poll nicht erkannt.
-      // Mit haltA → Karte geht in HALT → nächstes WUPA weckt sie wieder auf.
-      await r.haltA();
+      // ── Schritt 3: Karte in HALT versetzen ──
+      // halt() sendet HLTA + CRC → Karte geht in HALT-Zustand.
+      // WUPA beim nächsten Poll weckt sie dort wieder auf.
+      // Manche Clone-Module brauchen diesen sauberen Zustandswechsel,
+      // auch wenn WUPA theoretisch ohne HALT funktionieren könnte.
+      await r.halt();
 
     } catch (e) {
       errorCount++;
 
       console.error(
-        `RC522 loop Fehler ${errorCount}/${maxErrorsBeforeRestart} auf /dev/spidev${spiBus}.${spiDevice}:`,
-        e?.message || e
+        `RC522 loop Fehler ${errorCount}/${maxErrorsBeforeRestart} auf ` +
+        `/dev/spidev${spiBus}.${spiDevice}: ${e?.message || e}`
       );
+
+      if (debugMode) {
+        await r.dumpState("error");
+      }
 
       if (errorCount >= maxErrorsBeforeRestart) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
+        console.log(`[STATS:FINAL] ${r.statsLine()}`);
         process.exit(1);
       }
 
-      // Bei wiederholten Fehlern: vollen Soft-Reset + Re-Init versuchen
       if (errorCount >= 3) {
         try {
           console.log("RC522: Versuche Soft-Reset + Re-Init...");
           await r.softReset();
           await r.init();
           console.log("RC522: Re-Init erfolgreich");
-          errorCount = 0; // Reset hat geklappt, Zähler zurück
+          errorCount = 0;
         } catch (reinitErr) {
           console.error("RC522: Re-Init fehlgeschlagen:", reinitErr?.message);
         }
