@@ -165,7 +165,7 @@ function sleep(ms) {
           presentUid = null;
           missCount = 0;
 
-          await r.antennaReset();
+          // TEST: kein Reset nach REMOVED — saubere Isolation
         }
 
         await sleep(pollMs);
@@ -221,12 +221,11 @@ function sleep(ms) {
         console.log("PRESENT", uid);
       }
 
-      // ── Schritt 3: Karte in HALT versetzen ──
-      // halt() sendet HLTA + CRC → Karte geht in HALT-Zustand.
-      // WUPA beim nächsten Poll weckt sie dort wieder auf.
-      // Manche Clone-Module brauchen diesen sauberen Zustandswechsel,
-      // auch wenn WUPA theoretisch ohne HALT funktionieren könnte.
-      await r.halt();
+      // ── TEST: halt() deaktiviert ──
+      // Karte bleibt im READY/ACTIVE-Zustand.
+      // WUPA sollte sie trotzdem beim nächsten Poll ansprechen können.
+      // Wenn das Problem damit weg ist → halt() war die Ursache.
+      // await r.halt();
 
     } catch (e) {
       errorCount++;
