@@ -1,20 +1,11 @@
 /**
  * RC522 Reader Add-on (Home Assistant)
  *
- * Was macht diese App:
- * - Liest den RC522 RFID-Chip über SPI aus
- * - Erkennt RFID-Tags (Karten/Schlüsselanhänger) und liest ihre UID
- * - Publiziert Events per MQTT:
- *     <topic_base>/present  → wenn ein neuer Tag erkannt wird
- *     <topic_base>/removed  → wenn ein Tag entfernt wurde
- *     <topic_base>/state    → aktueller Zustand (immer aktuell, auch nach Reconnect)
- *
- * Robustheit:
- * - MQTT: reconnectet automatisch, publiziert nach Reconnect den aktuellen State neu
- * - RC522 Watchdog: nach 10 aufeinanderfolgenden SPI-Fehlern → Neustart
- * - missCount: "removed" erst nach mehreren Polls ohne Tag
- * - uidFailCount: wenn ein Tag erkannt wird, aber die UID mehrfach hintereinander
- *   nicht lesbar ist, wird ein Neustart erzwungen
+ * ÄNDERUNGEN gegenüber v0.3.5:
+ * - haltA() nach jedem erfolgreichen UID-Lesen → Karte wird deselektiert
+ * - antennaReset() bei "removed" → RF-Feld wird neu aufgebaut
+ * - Periodischer antennaReset alle N Polls → verhindert "taubes" Feld bei langem Kabel
+ * - requestA/anticollCL1 Fehler werden abgefangen statt den Loop zu crashen
  */
 
 const fs = require("fs");
@@ -55,12 +46,17 @@ function sleep(ms) {
   const maxUidFailsBeforeRestart = 8;
   const maxErrorsBeforeRestart = 10;
 
+  // NEU: Alle 50 Polls ohne Karte → Antenne kurz resetten
+  // Verhindert, dass das RF-Feld bei langem Kabel "einschläft"
+  const antennaResetInterval = 50;
+
   // ── 2) Zustandsvariablen ─────────────────────────────────────────────────
 
-  let presentUid = null;   // aktuell bekannter Tag oder null
-  let missCount = 0;       // Polls ohne Tag im Feld
-  let uidFailCount = 0;    // Tag im Feld, aber UID nicht lesbar
-  let errorCount = 0;      // echte SPI-/Reader-Fehler
+  let presentUid = null;
+  let missCount = 0;
+  let uidFailCount = 0;
+  let errorCount = 0;
+  let pollsSinceAntennaReset = 0; // NEU
 
   // ── 3) MQTT verbinden ────────────────────────────────────────────────────
 
@@ -123,10 +119,18 @@ function sleep(ms) {
     try {
       const now = Date.now();
 
+      // NEU: Periodischer Antenna-Reset wenn lange keine Karte da war
+      pollsSinceAntennaReset++;
+      if (!presentUid && pollsSinceAntennaReset >= antennaResetInterval) {
+        await r.antennaReset();
+        pollsSinceAntennaReset = 0;
+      }
+
       // Reader fragt: ist überhaupt etwas im Feld?
+      // Benutzt jetzt WUPA statt REQA → weckt auch gehaltete Karten
       const atqa = await r.requestA();
 
-      // requestA hat geantwortet → SPI/Reader lebt grundsätzlich
+      // requestA hat geantwortet → SPI/Reader lebt
       errorCount = 0;
 
       // Kein Tag im Feld
@@ -145,21 +149,26 @@ function sleep(ms) {
             JSON.stringify({ present: false, uid: null, ts: now })
           );
 
+          console.log("REMOVED", presentUid);
           presentUid = null;
           missCount = 0;
+
+          // NEU: Nach "removed" Antenne resetten → sauberer Neustart des RF-Feldes
+          await r.antennaReset();
+          pollsSinceAntennaReset = 0;
         }
 
         await sleep(pollMs);
         continue;
       }
 
-      // Es ist etwas im Feld → nicht als "kein Tag" zählen
+      // Es ist etwas im Feld
       missCount = 0;
+      pollsSinceAntennaReset = 0;
 
       // UID lesen
       const uid4 = await r.anticollCL1();
 
-      // Es ist etwas im Feld, aber UID nicht lesbar → problematischer Zwischenzustand
       if (!uid4) {
         uidFailCount++;
 
@@ -172,6 +181,8 @@ function sleep(ms) {
           process.exit(1);
         }
 
+        // NEU: haltA versuchen, damit die Karte in einen definierten Zustand geht
+        await r.haltA();
         await sleep(pollMs);
         continue;
       }
@@ -196,6 +207,13 @@ function sleep(ms) {
 
         console.log("PRESENT", uid);
       }
+
+      // ── NEU: Karte nach dem Lesen in HALT versetzen ──
+      // Das ist DER zentrale Fix: Ohne haltA bleibt die Karte im ACTIVE-Zustand.
+      // Eine ACTIVE Karte ignoriert REQA/WUPA und wird beim nächsten Poll nicht erkannt.
+      // Mit haltA → Karte geht in HALT → nächstes WUPA weckt sie wieder auf.
+      await r.haltA();
+
     } catch (e) {
       errorCount++;
 
@@ -208,6 +226,10 @@ function sleep(ms) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
         process.exit(1);
       }
+
+      // NEU: Bei SPI-Fehlern Antenne resetten — hilft bei langem Kabel
+      try { await r.antennaReset(); } catch {}
+      pollsSinceAntennaReset = 0;
 
       await sleep(500);
     }

@@ -4,9 +4,14 @@
 //   3. hardwareReset()        → zieht RST GPIO 25 kurz auf LOW via /dev/gpiomem0
 //   4. softReset delay 150ms  → Clone brauchen länger als Original-Chips
 //   5. Sanity-Check in init() → prüft ob SPI überhaupt funktioniert, klare Fehlermeldung
+//   6. haltA()                → Karte nach Lesung in HALT versetzen (ISO 14443)
+//   7. stopCrypto1()          → Crypto-Flag zurücksetzen nach Auth
+//   8. antennaReset()         → RF-Feld kurz aus/ein — erzwingt neuen Kartenzustand
+//   9. Kollisions-Toleranz    → REQA wirft bei CollErr keine Exception mehr
+//  10. Retry-Logik in readFifoBytes → toleriert einzelne SPI-Glitches
 
 const spi = require("spi-device");
-const fs  = require("fs"); // ← neu: für /dev/gpiomem
+const fs  = require("fs"); // ← für /dev/gpiomem
 
 // ---------- MFRC522 Befehle ----------
 const PCD_IDLE       = 0x00;
@@ -15,8 +20,10 @@ const PCD_TRANSCEIVE = 0x0C;
 const PCD_MFAUTHENT  = 0x0E;
 const PCD_SOFTRESET  = 0x0F;
 
-// ---------- PICC Befehle (das sind Kommandos die an die RFID-Karte gehen) ----------
+// ---------- PICC Befehle ----------
 const PICC_CMD_REQA          = 0x26;
+const PICC_CMD_WUPA          = 0x52;  // ← NEU: Wake-Up statt REQA
+const PICC_CMD_HLTA          = 0x50;  // ← NEU: Halt-Kommando
 const PICC_CMD_SEL_CL1       = 0x93;
 const PICC_CMD_ANTICOLL_CL1  = 0x20;
 const PICC_CMD_SELECT_CL1    = 0x70;
@@ -24,7 +31,7 @@ const PICC_CMD_MF_AUTH_KEY_A = 0x60;
 const PICC_CMD_MF_READ       = 0x30;
 const PICC_CMD_MF_WRITE      = 0xA0;
 
-// ---------- Register (Adressen im RC522-Chip) ----------
+// ---------- Register ----------
 const CommandReg    = 0x01;
 const ComIrqReg     = 0x04;
 const DivIrqReg     = 0x05;
@@ -50,14 +57,9 @@ const FIFO_FLUSH_MASK    = 0x80;
 const START_SEND_MASK    = 0x80;
 const STATUS2_CRYPTO1_ON = 0x08;
 
-// SPI-Adress-Helfer:
-// Der RC522 erwartet Adressen in einem bestimmten Format:
-// - Schreiben: Bit 7 = 0, Adresse in Bits 6-1
-// - Lesen:     Bit 7 = 1, Adresse in Bits 6-1
 function addrWrite(reg) { return (reg << 1) & 0x7E; }
 function addrRead(reg)  { return ((reg << 1) & 0x7E) | 0x80; }
 
-// Kleiner Helfer: wartet X Millisekunden
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function hexToBuf(hex) {
@@ -81,12 +83,10 @@ class MFRC522 {
   constructor(opts) {
     this.bus     = Number(opts.bus     ?? 0);
     this.device  = Number(opts.device  ?? 0);
-    this.speedHz = Number(opts.speedHz ?? 100_000); // 100 kHz, Clone-sicher
+    this.speedHz = Number(opts.speedHz ?? 100_000);
     this.dev     = null;
-    // RST ist fest auf GPIO 25 verdrahtet
   }
-  
-  // SPI-Verbindung öffnen
+
   open() {
     if (this.dev) return;
     this.dev = spi.openSync(this.bus, this.device, {
@@ -95,14 +95,12 @@ class MFRC522 {
     });
   }
 
-  // SPI-Verbindung schließen
   close() {
     if (!this.dev) return;
     try { this.dev.closeSync(); } catch {}
     this.dev = null;
   }
 
-  // Rohe SPI-Übertragung: schickt txBuf raus, empfängt gleich viele Bytes zurück
   async _xfer(txBuf) {
     return new Promise((resolve, reject) => {
       const message = [{
@@ -118,18 +116,15 @@ class MFRC522 {
     });
   }
 
-  // Ein Register beschreiben
   async writeReg(reg, value) {
     await this._xfer(Buffer.from([addrWrite(reg), value & 0xFF]));
   }
 
-  // Ein Register lesen
   async readReg(reg) {
     const rx = await this._xfer(Buffer.from([addrRead(reg), 0x00]));
     return rx[1];
   }
 
-  // Mehrere Bytes auf einmal in ein Register schreiben (z.B. FIFO befüllen)
   async writeRegMany(reg, dataBuf) {
     const tx = Buffer.alloc(1 + dataBuf.length);
     tx[0] = addrWrite(reg);
@@ -137,114 +132,134 @@ class MFRC522 {
     await this._xfer(tx);
   }
 
-  // FIFO einzeln auslesen — manche Clone-Module brechen bei Burst-Reads zusammen
+  // FIFO einzeln auslesen — mit Retry bei Glitch
   async readFifoBytes(n) {
     const out = Buffer.alloc(n);
-    for (let i = 0; i < n; i++) out[i] = await this.readReg(FIFODataReg);
+    for (let i = 0; i < n; i++) {
+      let val = await this.readReg(FIFODataReg);
+      // Bei 0xFF nochmal versuchen (typischer SPI-Glitch bei langem Kabel)
+      if (val === 0xFF && n <= 5) {
+        await sleep(1);
+        val = await this.readReg(FIFODataReg);
+      }
+      out[i] = val;
+    }
     return out;
   }
 
   async fifoFlush() { await this.writeReg(FIFOLevelReg, FIFO_FLUSH_MASK); }
   async fifoLevel() { return await this.readReg(FIFOLevelReg); }
 
-// Hardware-Reset über direkten /dev/gpiomem Zugriff
-// (funktioniert auf HAOS wo /sys/class/gpio gesperrt ist)
-async hardwareReset() {
-  const GPIO_BASE_OFFSET = 0;        // gpiomem startet direkt beim GPIO-Controller
-  const GPFSEL2 = 2;                 // Register für GPIO 20-29 (Pin 25 liegt hier)
-  const GPSET0  = 7;                 // Register: Pin auf HIGH setzen
-  const GPCLR0  = 10;                // Register: Pin auf LOW setzen
-
-  let fd;
-  try {
-    // /dev/gpiomem öffnen — das ist unser direkter Draht zum GPIO-Controller
-    fd = fs.openSync("/dev/gpiomem0", "r+");
-
-    // Den Speicher als 32-bit Integer Buffer einlesen (je 4 Bytes = 1 Register)
-    const mem = Buffer.alloc(4 * 64);
-    fs.readSync(fd, mem, 0, mem.length, GPIO_BASE_OFFSET);
-
-    // Pin 25 als OUTPUT konfigurieren
-    // GPFSEL2 steuert Pins 20-29, je 3 Bits pro Pin
-    // Pin 25 → Bits 15-17 in GPFSEL2
-    const fselOffset = GPFSEL2 * 4;
-    let fsel = mem.readUInt32LE(fselOffset);
-    fsel &= ~(0b111 << 15);  // Bits 15-17 löschen
-    fsel |=  (0b001 << 15);  // 001 = OUTPUT
-    mem.writeUInt32LE(fsel, fselOffset);
-    fs.writeSync(fd, mem, fselOffset, 4, fselOffset);
-
-    // Hilfsfunktionen zum Setzen/Löschen des Pins
-    const pinBit = 1 << 25; // Bit 25 in GPSET0/GPCLR0
-
-    const setHigh = () => {
-      const buf = Buffer.alloc(4);
-      buf.writeUInt32LE(pinBit, 0);
-      fs.writeSync(fd, buf, 0, 4, GPSET0 * 4);
-    };
-    const setLow = () => {
-      const buf = Buffer.alloc(4);
-      buf.writeUInt32LE(pinBit, 0);
-      fs.writeSync(fd, buf, 0, 4, GPCLR0 * 4);
-    };
-
-    // Reset-Sequenz: HIGH → LOW → HIGH
-    setHigh();
-    await sleep(10);
-    setLow();   // ← Reset auslösen
-    await sleep(10);
-    setHigh();  // ← Reset beenden
-    await sleep(50);
-
-    console.log(`RC522: Hardware-Reset GPIO 25 OK`);
-
-  } catch (e) {
-    console.warn(`RC522: GPIO Reset fehlgeschlagen:`, e.message);
-    console.warn(`RC522: Starte ohne Hardware-Reset weiter...`);
-  } finally {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  // ── NEU: Antenne kurz aus/ein → RF-Feld wird neu aufgebaut ──
+  // Dadurch vergessen alle Karten im Feld ihren Zustand und sind wieder ansprechbar
+  async antennaReset() {
+    const v = await this.readReg(TxControlReg);
+    await this.writeReg(TxControlReg, v & ~0x03); // Antenne AUS
+    await sleep(50);                                // 50ms reicht für Feld-Abbau
+    await this.writeReg(TxControlReg, v | 0x03);  // Antenne AN
+    await sleep(10);                                // kurz stabilisieren lassen
   }
-}
 
-  // Software-Reset: schickt Reset-Befehl über SPI an den Chip
-  // GEÄNDERT: 150ms statt 50ms — Clone brauchen mehr Zeit
+  // ── NEU: Crypto1-Flag zurücksetzen ──
+  // Nach einer Mifare-Authentifizierung bleibt Crypto1 aktiv.
+  // Das muss zurückgesetzt werden, sonst funktionieren danach keine normalen Befehle.
+  async stopCrypto1() {
+    const s2 = await this.readReg(Status2Reg);
+    if (s2 & STATUS2_CRYPTO1_ON) {
+      await this.writeReg(Status2Reg, s2 & ~STATUS2_CRYPTO1_ON);
+    }
+  }
+
+  // ── NEU: HaltA — Karte in den HALT-Zustand schicken ──
+  // Eine gehaltete Karte reagiert nicht mehr auf REQA, aber auf WUPA.
+  // Das ist wichtig, damit dieselbe Karte beim nächsten Poll wieder erkannt werden kann.
+  async haltA() {
+    try {
+      const cmd = Buffer.from([PICC_CMD_HLTA, 0x00]);
+      const crc = await this.calcCrc(cmd);
+      // HaltA bekommt absichtlich keine gültige Antwort — Timeout ist normal
+      await this.transceive(Buffer.concat([cmd, crc]), 0, 50, true);
+    } catch {
+      // Timeout/Fehler ist hier erwartet und OK
+    }
+    await this.stopCrypto1();
+  }
+
+  // Hardware-Reset über /dev/gpiomem
+  async hardwareReset() {
+    const GPFSEL2 = 2;
+    const GPSET0  = 7;
+    const GPCLR0  = 10;
+
+    let fd;
+    try {
+      fd = fs.openSync("/dev/gpiomem0", "r+");
+
+      const mem = Buffer.alloc(4 * 64);
+      fs.readSync(fd, mem, 0, mem.length, 0);
+
+      const fselOffset = GPFSEL2 * 4;
+      let fsel = mem.readUInt32LE(fselOffset);
+      fsel &= ~(0b111 << 15);
+      fsel |=  (0b001 << 15);
+      mem.writeUInt32LE(fsel, fselOffset);
+      fs.writeSync(fd, mem, fselOffset, 4, fselOffset);
+
+      const pinBit = 1 << 25;
+
+      const setHigh = () => {
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE(pinBit, 0);
+        fs.writeSync(fd, buf, 0, 4, GPSET0 * 4);
+      };
+      const setLow = () => {
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE(pinBit, 0);
+        fs.writeSync(fd, buf, 0, 4, GPCLR0 * 4);
+      };
+
+      setHigh();
+      await sleep(10);
+      setLow();
+      await sleep(10);
+      setHigh();
+      await sleep(50);
+
+      console.log(`RC522: Hardware-Reset GPIO 25 OK`);
+
+    } catch (e) {
+      console.warn(`RC522: GPIO Reset fehlgeschlagen:`, e.message);
+      console.warn(`RC522: Starte ohne Hardware-Reset weiter...`);
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    }
+  }
+
   async softReset() {
     await this.writeReg(CommandReg, PCD_SOFTRESET);
     await sleep(150);
   }
 
-  // Antenne einschalten (ohne Antenne kann der RC522 keine Karten lesen)
   async antennaOn() {
     const v = await this.readReg(TxControlReg);
     if ((v & 0x03) !== 0x03) await this.writeReg(TxControlReg, v | 0x03);
   }
 
-  // Chip initialisieren — wird einmal beim Start aufgerufen
   async init() {
-    // Schritt 1: Hardware-Reset (GPIO Pin)
     await this.hardwareReset();
-
-    // Schritt 2: Software-Reset (über SPI)
     await this.softReset();
 
-    // Schritt 3: NEU — Sanity-Check
-    // Nach dem Reset muss ModeReg den Wert 0x3F haben.
-    // Wenn wir 0xFF lesen → SPI liefert nur Einsen → Chip antwortet nicht
-    // Wenn wir 0x00 lesen → Chip hängt
-    // Beides bedeutet: Verkabelung prüfen!
     const check = await this.readReg(ModeReg);
     if (check === 0xFF || check === 0x00) {
-        throw new Error(
+      throw new Error(
         `RC522 antwortet nicht! ModeReg=0x${check.toString(16)}\n` +
         `→ Verkabelung prüfen (/dev/spidev${this.bus}.${this.device})\n` +
         `→ RST-Pin prüfen: GPIO 25\n` +
         `→ Spannung prüfen: muss 3.3V sein, niemals 5V!`
-        );
+      );
     }
     console.log(`RC522: SPI OK (ModeReg=0x${check.toString(16)})`);
 
-    // Schritt 4: Timer und Modus konfigurieren
-    // (Diese Werte kommen aus dem RC522-Datenblatt, nicht ändern)
     await this.writeReg(TModeReg,      0x8D);
     await this.writeReg(TPrescalerReg, 0x3E);
     await this.writeReg(TReloadRegL,   30);
@@ -252,11 +267,9 @@ async hardwareReset() {
     await this.writeReg(TxASKReg,      0x40);
     await this.writeReg(ModeReg,       0x3D);
 
-    // Schritt 5: Antenne an
     await this.antennaOn();
   }
 
-  // CRC berechnen (Prüfsumme für die Kommunikation mit der Karte)
   async calcCrc(dataBuf) {
     await this.writeReg(CommandReg, PCD_IDLE);
     await this.writeReg(DivIrqReg, 0x04);
@@ -276,8 +289,8 @@ async hardwareReset() {
     return Buffer.from([crcL, crcH]);
   }
 
-  // Daten senden und Antwort empfangen (Kern der RFID-Kommunikation)
-  async transceive(txBuf, validBitsLastByte = 0, timeoutMs = 200) {
+  // GEÄNDERT: neuer Parameter ignoreCollision
+  async transceive(txBuf, validBitsLastByte = 0, timeoutMs = 200, ignoreCollision = false) {
     await this.writeReg(CommandReg, PCD_IDLE);
     await this.writeReg(ComIrqReg, 0x7F);
     await this.fifoFlush();
@@ -286,6 +299,9 @@ async hardwareReset() {
     const txLastBits = validBitsLastByte & 0x07;
     await this.writeReg(BitFramingReg, txLastBits);
     await this.writeReg(CommandReg, PCD_TRANSCEIVE);
+
+    // GEÄNDERT: kurzes Delay vor StartSend — gibt dem Chip Zeit sich vorzubereiten
+    await sleep(1);
     await this.writeReg(BitFramingReg, txLastBits | START_SEND_MASK);
 
     const t0 = Date.now();
@@ -293,7 +309,7 @@ async hardwareReset() {
 
     while (true) {
       irq = await this.readReg(ComIrqReg);
-      if (irq & 0x20) break; // RxIRq = Antwort empfangen
+      if (irq & 0x20) break;
       if (irq & 0x01) return { data: Buffer.alloc(0), rxLastBits: 0, errorReg: await this.readReg(ErrorReg), irqReg: irq, fifo: 0, note: "TimerIRq" };
       if (Date.now() - t0 > timeoutMs) return { data: Buffer.alloc(0), rxLastBits: 0, errorReg: await this.readReg(ErrorReg), irqReg: irq, fifo: 0, note: "Timeout" };
     }
@@ -301,7 +317,9 @@ async hardwareReset() {
     await this.writeReg(BitFramingReg, 0x00);
 
     const err = await this.readReg(ErrorReg);
-    if (err & 0x1B) throw new Error(`Transceive ErrorReg=0x${err.toString(16)}`);
+    // GEÄNDERT: Bei ignoreCollision wird CollErr (0x08) nicht als Fehler gewertet
+    const mask = ignoreCollision ? 0x13 : 0x1B;
+    if (err & mask) throw new Error(`Transceive ErrorReg=0x${err.toString(16)}`);
 
     const n = await this.fifoLevel();
     const rxData = n > 0 ? await this.readFifoBytes(n) : Buffer.alloc(0);
@@ -311,30 +329,37 @@ async hardwareReset() {
     return { data: rxData, rxLastBits, errorReg: err, irqReg: irq, fifo: n };
   }
 
-  // ---------- PICC Helfer (Karten-Kommunikation) ----------
+  // ---------- PICC Helfer ----------
 
-  // Fragt: "Ist eine Karte im Feld?" → gibt ATQA zurück oder null
+  // GEÄNDERT: benutzt WUPA statt REQA — weckt auch gehaltete Karten auf
+  // + ignoreCollision = true
   async requestA() {
-    const res = await this.transceive(Buffer.from([PICC_CMD_REQA]), 7, 80);
-    if (res.data.length !== 2) return null;
-    return res.data;
+    try {
+      const res = await this.transceive(Buffer.from([PICC_CMD_WUPA]), 7, 80, true);
+      if (res.data.length !== 2) return null;
+      return res.data;
+    } catch {
+      return null;
+    }
   }
 
-  // Liest die UID der Karte (4 Bytes)
   async anticollCL1() {
-    await this.writeReg(CollReg, 0x80);
-    const res = await this.transceive(
-      Buffer.from([PICC_CMD_SEL_CL1, PICC_CMD_ANTICOLL_CL1]), 0, 80
-    );
-    if (res.data.length < 5) return null;
+    try {
+      await this.writeReg(CollReg, 0x80);
+      const res = await this.transceive(
+        Buffer.from([PICC_CMD_SEL_CL1, PICC_CMD_ANTICOLL_CL1]), 0, 80, true
+      );
+      if (res.data.length < 5) return null;
 
-    const uid4 = res.data.subarray(0, 4);
-    const bcc  = res.data[4];
-    // BCC = XOR aller 4 UID-Bytes, damit Übertragungsfehler erkannt werden
-    const calc = uid4[0] ^ uid4[1] ^ uid4[2] ^ uid4[3];
-    if (calc !== bcc) return null;
+      const uid4 = res.data.subarray(0, 4);
+      const bcc  = res.data[4];
+      const calc = uid4[0] ^ uid4[1] ^ uid4[2] ^ uid4[3];
+      if (calc !== bcc) return null;
 
-    return Buffer.from(uid4);
+      return Buffer.from(uid4);
+    } catch {
+      return null;
+    }
   }
 
   async selectCL1(uid4) {
@@ -416,7 +441,6 @@ async hardwareReset() {
     return true;
   }
 
-  // UID-Buffer in lesbaren Hex-String umwandeln (z.B. "8aeda760")
   static uidToHex(uidBuf) { return Buffer.from(uidBuf).toString("hex"); }
   static bufToHex(buf)     { return Buffer.from(buf).toString("hex"); }
   static isTrailerBlock(b) { return (Number(b) % 4) === 3; }
