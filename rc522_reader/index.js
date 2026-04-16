@@ -120,7 +120,7 @@ function sleep(ms) {
     try {
       const now = Date.now();
       pollCount++;
-      r._stats.polls = pollCount;
+      if (r._stats) r._stats.polls = pollCount;
 
       // Periodische Statistik (nur bei debug)
       if (debugMode && (pollCount % statsLogInterval) === 0) {
@@ -221,11 +221,12 @@ function sleep(ms) {
         console.log("PRESENT", uid);
       }
 
-      // ── TEST: halt() deaktiviert ──
-      // Karte bleibt im READY/ACTIVE-Zustand.
-      // WUPA sollte sie trotzdem beim nächsten Poll ansprechen können.
-      // Wenn das Problem damit weg ist → halt() war die Ursache.
-      // await r.halt();
+      // ── Schritt 3: Karte in HALT versetzen ──
+      // halt() nur wenn selectTag() erfolgreich war (Karte im ACTIVE-Zustand).
+      // Ohne vorheriges SELECT ist HALT undefiniert und kann Clone-Chips verwirren.
+      if (idResult.selected) {
+        await r.halt();
+      }
 
     } catch (e) {
       errorCount++;

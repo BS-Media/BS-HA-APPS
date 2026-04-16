@@ -490,7 +490,9 @@ class MFRC522 {
   }
 
   // ── readId: Vollständige UID lesen (CL1 + optional CL2) ──
-  // Gibt { uid: array, uidHex: string } zurück oder null
+  // Macht immer anticoll + selectTag, damit die Karte im ACTIVE-Zustand ist.
+  // Gibt { uid: array, uidHex: string, selected: boolean } zurück oder null.
+  // Wenn selected=true ist, kann der Aufrufer danach sicher halt() aufrufen.
   async readId() {
     // CL1 anticoll
     const uid1 = await this.anticoll(PICC_SEL_CL1);
@@ -498,10 +500,12 @@ class MFRC522 {
 
     // uid1[0] === 0x88 → Cascade Tag → UID ist länger als 4 Bytes
     if (uid1[0] !== 0x88) {
-      // Normale 4-Byte-UID
+      // Normale 4-Byte-UID → selectTag, damit Karte in ACTIVE-Zustand geht
+      const sel = await this.selectTag(uid1, PICC_SEL_CL1);
       return {
         uid: uid1.slice(0, 4),
         uidHex: uid1.slice(0, 4).map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
+        selected: sel.ok,
       };
     }
 
@@ -520,11 +524,15 @@ class MFRC522 {
       return null;
     }
 
+    // CL2 Select
+    const sel2 = await this.selectTag(uid2, PICC_SEL_CL2);
+
     // 7-Byte-UID: uid1[1..3] + uid2[0..3]
     const fullUid = [...uid1.slice(1, 4), ...uid2.slice(0, 4)];
     return {
       uid: fullUid,
       uidHex: fullUid.map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
+      selected: sel2.ok,
     };
   }
 
