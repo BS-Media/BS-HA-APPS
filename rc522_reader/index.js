@@ -7,13 +7,7 @@
  *
  * Ablauf pro Poll:
  *   1. request(WUPA) → ist eine Karte da?
- *   2. readId()      → UID lesen (anticoll, bei Cascade auch CL2)
- *   3. fertig        → kein halt(), kein antennaReset()
- *
- * Karte bleibt nach dem Lesen im READY-Zustand.
- * WUPA beim nächsten Poll spricht sie dort zuverlässig an.
- *
- * Reset (softReset + init) nur bei echten SPI-/Reader-Fehlern.
+ *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
  */
 
 const fs = require("fs");
@@ -32,8 +26,6 @@ function sleep(ms) {
 }
 
 (async () => {
-  // ── 1) Konfiguration ────────────────────────────────────────────────────
-
   const o = loadOptions();
 
   const spiPath = String(o.spi_path || "").trim();
@@ -48,16 +40,14 @@ function sleep(ms) {
   }
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
-  const pollMs    = Math.max(50, Number(o.poll_ms ?? 200));
-  const removedMs = Math.max(100, Number(o.removed_ms ?? 800));
-  const debugMode = Boolean(o.debug ?? false);
+  const pollMs = Math.max(50, Number(o.poll_ms ?? 300));
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 1200));
+  const debugMode = Boolean(o.debug ?? true);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
   const maxUidFailsBeforeReInit = 8;
   const maxErrorsBeforeRestart = 10;
   const statsLogInterval = 500;
-
-  // ── 2) Zustandsvariablen ────────────────────────────────────────────────
 
   let presentUid = null;
   let missCount = 0;
@@ -68,8 +58,6 @@ function sleep(ms) {
   function dbg(...args) {
     if (debugMode) console.log("[MAIN:DBG]", ...args);
   }
-
-  // ── 3) MQTT ─────────────────────────────────────────────────────────────
 
   const url = `mqtt://${o.mqtt_host}:${Number(o.mqtt_port || 1883)}`;
 
@@ -82,7 +70,11 @@ function sleep(ms) {
     console.log("MQTT connected:", url, "topic:", topicBase);
     client.publish(
       `${topicBase}/state`,
-      JSON.stringify({ present: presentUid !== null, uid: presentUid, ts: Date.now() }),
+      JSON.stringify({
+        present: presentUid !== null,
+        uid: presentUid,
+        ts: Date.now(),
+      }),
       { retain: true }
     );
   });
@@ -91,13 +83,11 @@ function sleep(ms) {
   client.on("close", () => console.warn("MQTT Verbindung getrennt — Reconnect..."));
   client.on("reconnect", () => console.log("MQTT reconnecting..."));
 
-  // ── 4) RC522 init ───────────────────────────────────────────────────────
-
   const r = new MFRC522({
     bus: spiBus,
     device: spiDevice,
     speedHz: 100_000,
-    antennaGain: 0x04, // 33 dB
+    antennaGain: 0x04,
     debug: debugMode,
   });
 
@@ -118,30 +108,24 @@ function sleep(ms) {
     `Removed: ${removedMs}ms (${maxMissesBeforeRemoved} misses)`
   );
 
-  // ── 5) Hauptloop ────────────────────────────────────────────────────────
-
   while (true) {
     try {
       const now = Date.now();
       pollCount++;
       if (r._stats) r._stats.polls = pollCount;
 
-      // Debug-Statistik
       if (debugMode && (pollCount % statsLogInterval) === 0) {
         console.log(`[STATS] ${r.statsLine()}`);
         await r.dumpState("periodic");
       }
 
-      // ── Schritt 1: Ist eine Karte im Feld? ──
       const atqa = await r.request(0x52); // WUPA
-
-      // SPI lebt → errorCount zurücksetzen
       errorCount = 0;
 
       if (!atqa) {
-        // Keine Karte
         uidFailCount = 0;
         missCount++;
+        dbg("no atqa", { missCount, presentUid });
 
         if (presentUid && missCount >= maxMissesBeforeRemoved) {
           client.publish(
@@ -156,20 +140,24 @@ function sleep(ms) {
           console.log("REMOVED", presentUid);
           presentUid = null;
           missCount = 0;
+
+          // Nur kurze Ruhezeit, kein halt(), kein antennaReset()
+          await sleep(300);
         }
 
         await sleep(pollMs);
         continue;
       }
 
-      // ── Schritt 2: UID lesen ──
+      dbg("atqa ok", atqa);
+
       missCount = 0;
 
       const idResult = await r.readId();
 
       if (!idResult) {
         uidFailCount++;
-        dbg(`UID-Lesung fehlgeschlagen ${uidFailCount}/${maxUidFailsBeforeReInit}`);
+        dbg("atqa ok, readId failed", { uidFailCount });
 
         if (uidFailCount >= maxUidFailsBeforeReInit) {
           console.warn(
@@ -192,6 +180,7 @@ function sleep(ms) {
       uidFailCount = 0;
 
       const uid = idResult.uidHex;
+      dbg("readId ok", { uid });
 
       if (uid !== presentUid) {
         presentUid = uid;
@@ -208,8 +197,8 @@ function sleep(ms) {
         console.log("PRESENT", uid);
       }
 
-      // Kein halt(), kein antennaReset() — Karte bleibt in READY,
-      // WUPA beim nächsten Poll spricht sie dort zuverlässig an.
+      // bewusst kein halt()
+      // bewusst kein antennaReset() im Normalpfad
 
     } catch (e) {
       errorCount++;
@@ -225,11 +214,10 @@ function sleep(ms) {
 
       if (errorCount >= maxErrorsBeforeRestart) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
-        if (r._stats) console.log(`[STATS:FINAL] ${r.statsLine()}`);
+        console.log(`[STATS:FINAL] ${r.statsLine()}`);
         process.exit(1);
       }
 
-      // Bei wiederholten Fehlern: voller Reset
       if (errorCount >= 3) {
         try {
           console.log("RC522: Versuche Soft-Reset + Re-Init...");
