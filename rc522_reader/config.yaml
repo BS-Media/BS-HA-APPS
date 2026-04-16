@@ -1,6 +1,6 @@
 name: "RC522 Reader"
 description: "Reads RC522 via SPI and publishes UID to MQTT"
-version: "0.5.2"
+version: "0.5.3"
 slug: "rc522_reader"
 init: false
 startup: services
@@ -13,7 +13,7 @@ devices:
   - /dev/spidev0.1
   - /dev/spidev10.0
   - /dev/spidev10.1
-  - /dev/gpiomem0
+  - /dev/gpiochip0
 
 options:
   mqtt_host: "core-mosquitto"
@@ -41,6 +41,9 @@ schema:
   removed_ms: "int(100,5000)"
   debug: bool
 
+# Für den ersten Test noch drin lassen.
+# Wenn der gpiochip-Reset stabil läuft, kannst du SYS_RAWIO/map gpio
+# später testweise entfernen.
 privileged:
   - SYS_RAWIO
 map:

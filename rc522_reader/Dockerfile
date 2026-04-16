@@ -3,7 +3,8 @@ FROM $BUILD_FROM
 
 RUN apk add --no-cache \
   nodejs npm \
-  python3 build-base linux-headers
+  python3 build-base linux-headers \
+  libgpiod
 
 WORKDIR /app
 COPY package.json package-lock.json ./

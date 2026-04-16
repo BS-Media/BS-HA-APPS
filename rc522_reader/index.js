@@ -8,6 +8,9 @@
  * Ablauf pro Poll:
  *   1. request(WUPA) → ist eine Karte da?
  *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
+ *
+ * Kein halt(), kein antennaReset() im Normalpfad.
+ * Reset (softReset + init) nur bei echten Reader-/SPI-Fehlern.
  */
 
 const fs = require("fs");
@@ -25,8 +28,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ── Prozess-/Crash-Diagnose ───────────────────────────────────────────────
-
+// Diagnose: sichtbar machen, falls der Prozess extern beendet oder intern crasht
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err?.stack || err);
 });
@@ -62,9 +64,9 @@ process.on("SIGINT", () => {
   }
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
-  const pollMs = Math.max(50, Number(o.poll_ms ?? 300));
-  const removedMs = Math.max(100, Number(o.removed_ms ?? 1200));
-  const debugMode = Boolean(o.debug ?? true);
+  const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 800));
+  const debugMode = Boolean(o.debug ?? false);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
   const maxUidFailsBeforeReInit = 8;
@@ -246,7 +248,7 @@ process.on("SIGINT", () => {
 
       if (errorCount >= maxErrorsBeforeRestart) {
         console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
-        console.log(`[STATS:FINAL] ${r.statsLine()}`);
+        if (r._stats) console.log(`[STATS:FINAL] ${r.statsLine()}`);
         process.exit(1);
       }
 
