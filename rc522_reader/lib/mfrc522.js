@@ -7,7 +7,7 @@
 // Reset nur bei echten SPI-/Reader-Fehlern über softReset() + init().
 
 const spi = require("spi-device");
-const fs  = require("fs");
+const { execSync } = require("child_process");
 
 // ── PCD (Reader) Kommandos ──
 const PCD_IDLE       = 0x00;
@@ -184,38 +184,28 @@ class MFRC522 {
     return out;
   }
 
-  // ── Hardware-Reset (GPIO 25, BCM2835/BCM2711) ──
+  // ── Hardware-Reset (RST auf GPIO 25 via libgpiod / gpioset) ──
+  // /dev/gpiochip0 statt alter /dev/gpiomem0-Registerzugriffe.
+  // Für Alpine liefert das Paket "libgpiod" das Tool "gpioset".
 
   async hardwareReset() {
-    let fd;
     try {
-      fd = fs.openSync("/dev/gpiomem0", "r+");
-      const mem = Buffer.alloc(4 * 64);
-      fs.readSync(fd, mem, 0, mem.length, 0);
+      // LOW für 10 ms, dann HIGH für 50 ms.
+      // -m time sorgt dafür, dass gpioset nach der Haltezeit wieder endet.
+      execSync("gpioset -m time -u 10000 /dev/gpiochip0 25=0", {
+        timeout: 3000,
+        stdio: "pipe",
+      });
+      execSync("gpioset -m time -u 50000 /dev/gpiochip0 25=1", {
+        timeout: 3000,
+        stdio: "pipe",
+      });
 
-      const fselOff = 2 * 4;
-      let fsel = mem.readUInt32LE(fselOff);
-      fsel &= ~(0b111 << 15);
-      fsel |=  (0b001 << 15);
-      mem.writeUInt32LE(fsel, fselOff);
-      fs.writeSync(fd, mem, fselOff, 4, fselOff);
-
-      const pinBit = 1 << 25;
-      const setPin = (high) => {
-        const buf = Buffer.alloc(4);
-        buf.writeUInt32LE(pinBit, 0);
-        fs.writeSync(fd, buf, 0, 4, (high ? 7 : 10) * 4);
-      };
-
-      setPin(true);  await sleep(10);
-      setPin(false); await sleep(10);
-      setPin(true);  await sleep(50);
+      await sleep(50);
       console.log("RC522: Hardware-Reset GPIO 25 OK");
     } catch (e) {
-      console.warn("RC522: GPIO Reset fehlgeschlagen:", e.message);
+      console.warn("RC522: GPIO Reset fehlgeschlagen:", e?.message || e);
       console.warn("RC522: Starte ohne Hardware-Reset weiter...");
-    } finally {
-      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
     }
   }
 
@@ -475,7 +465,7 @@ class MFRC522 {
   // readId() — liest die UID (4 oder 7 Bytes)
   // Für 4-Byte-UIDs: nur anticoll, kein selectTag.
   // Karte bleibt in READY — WUPA beim nächsten Poll spricht sie dort an.
-  // Für 7-Byte-UIDs: selectTag für CL1 nötig, dann CL2 anticoll.
+  // Für 7-Byte-UIDs: selectTag für CL1 nötig um CL2 zu lesen.
   async readId() {
     const uid1 = await this.anticoll(PICC_SEL_CL1);
     if (!uid1) return null;
@@ -512,7 +502,7 @@ class MFRC522 {
 
   // halt() — Karte von ACTIVE nach HALT versetzen
   // Wird im Normalpfad NICHT aufgerufen.
-  // Nur verfügbar für spezielle Anwendungsfälle (nach selectTag + Mifare-Ops).
+  // Nur verfügbar für spezielle Anwendungsfälle.
   async halt() {
     try {
       const cmd = [PICC_HALT, 0x00];
