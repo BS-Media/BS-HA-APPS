@@ -501,7 +501,7 @@ class MFRC522 {
       // Normale 4-Byte-UID
       return {
         uid: uid1.slice(0, 4),
-        uidHex: hexArr(uid1.slice(0, 4)).replace(/ /g, ""),
+        uidHex: uid1.slice(0, 4).map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
       };
     }
 
@@ -524,7 +524,7 @@ class MFRC522 {
     const fullUid = [...uid1.slice(1, 4), ...uid2.slice(0, 4)];
     return {
       uid: fullUid,
-      uidHex: fullUid.map(b => hex(b).slice(2)).join(""),
+      uidHex: fullUid.map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
     };
   }
 
