@@ -65,7 +65,11 @@ process.on("SIGINT", () => {
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
-  const removedMs = Math.max(100, Number(o.removed_ms ?? 2000));
+  const configuredRemovedMs = Number(o.removed_ms ?? 2000);
+  const removedMs = Math.max(
+    100,
+    configuredRemovedMs === 800 ? 2000 : configuredRemovedMs
+  );
   const debugMode = Boolean(o.debug ?? false);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
@@ -74,16 +78,23 @@ process.on("SIGINT", () => {
   const statsLogInterval = 500;
   const heartbeatInterval = 50;
   const idleRecoveryMissThreshold = Math.max(50, Math.ceil(10000 / pollMs));
+  const idleRecoveryCooldownMs = 120_000;
 
   let presentUid = null;
   let missCount = 0;
   let uidFailCount = 0;
   let errorCount = 0;
   let pollCount = 0;
-  let idleRecoveryDone = false;
+  let lastIdleRecoveryAt = 0;
 
   function dbg(...args) {
     if (debugMode) console.log("[MAIN:DBG]", ...args);
+  }
+
+  if (configuredRemovedMs === 800) {
+    console.warn(
+      "RC522: Legacy removed_ms=800 erkannt — verwende 2000ms fuer stabileren Betrieb"
+    );
   }
 
   async function publishRemoved(now, reason) {
@@ -102,7 +113,7 @@ process.on("SIGINT", () => {
 
     presentUid = null;
     missCount = 0;
-    idleRecoveryDone = false;
+    lastIdleRecoveryAt = 0;
   }
 
   const url = `mqtt://${o.mqtt_host}:${Number(o.mqtt_port || 1883)}`;
@@ -194,8 +205,11 @@ process.on("SIGINT", () => {
           await publishRemoved(now, "no-atqa");
         }
 
-        if (!presentUid && !idleRecoveryDone && missCount >= idleRecoveryMissThreshold) {
-          idleRecoveryDone = true;
+        const idleRecoveryAllowedAt =
+          lastIdleRecoveryAt === 0 ? 0 : lastIdleRecoveryAt + idleRecoveryCooldownMs;
+
+        if (!presentUid && missCount >= idleRecoveryMissThreshold && now >= idleRecoveryAllowedAt) {
+          lastIdleRecoveryAt = now;
           console.warn(
             `RC522: ${missCount} Misses ohne Tag → gezielte Idle-Recovery`
           );
@@ -214,7 +228,7 @@ process.on("SIGINT", () => {
       }
 
       dbg("atqa ok", atqa);
-      idleRecoveryDone = false;
+      lastIdleRecoveryAt = 0;
 
       const idResult = await r.readId();
 
@@ -242,7 +256,7 @@ process.on("SIGINT", () => {
 
       uidFailCount = 0;
       missCount = 0;
-      idleRecoveryDone = false;
+      lastIdleRecoveryAt = 0;
 
       const uid = idResult.uidHex;
       dbg("readId ok", { uid });
