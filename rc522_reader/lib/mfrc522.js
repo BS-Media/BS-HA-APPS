@@ -187,11 +187,11 @@ class MFRC522 {
   async hardwareReset() {
     try {
       // libgpiod v2 Syntax
-      execSync("gpioset -p 10ms -t0 /dev/gpiochip0 25=0", {
+      execSync("gpioset -p 10ms -t0 -c /dev/gpiochip0 25=0", {
         timeout: 3000,
         stdio: "pipe",
       });
-      execSync("gpioset -p 50ms -t0 /dev/gpiochip0 25=1", {
+      execSync("gpioset -p 50ms -t0 -c /dev/gpiochip0 25=1", {
         timeout: 3000,
         stdio: "pipe",
       });
@@ -219,6 +219,7 @@ class MFRC522 {
       }
     }
   }
+
 
 
   // ── Init ──

@@ -1,6 +1,6 @@
 {
   "name": "ha-rc522-reader",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "type": "commonjs",
   "dependencies": {
     "mqtt": "^5.10.0",
