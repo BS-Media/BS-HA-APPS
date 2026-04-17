@@ -1,200 +1,186 @@
-// MFRC522 Node.js Treiber
-// Orientiert an pi-rc522 (Python) von ondryaso
-// Angepasst für: Clone-Module, langes Kabel, HAOS ohne RPi.GPIO
-//
-// Reader-Recovery ist bei günstigen RC522-Boards wichtig.
-// Im Normalpfad bleiben wir bei request(WUPA) → anticoll → UID lesen.
-// Zusätzliche Resets nur gezielt bei echten Hängern.
+          `${(errReg & 0x02) ? "Parity " : ""}` +
+          `${(errReg & 0x08) ? "Collision " : ""}` +
+          `${(errReg & 0x10) ? "BufferOvfl " : ""}` +
+          `), tx=[${hexArr(data)}]`
+        );
+      }
+    }
 
-const spi = require("spi-device");
-const { execSync } = require("child_process");
+    this._dbg(
+      `cardWrite: cmd=${hex(command)} tx=[${hexArr(data)}] → ` +
+      `err=${error} bits=${backBits} rx=[${hexArr(backData)}] loops=${2000 - i}`
+    );
 
-// ── PCD (Reader) Kommandos ──
-const PCD_IDLE       = 0x00;
-const PCD_CALC_CRC   = 0x03;
-const PCD_TRANSCEIVE = 0x0C;
-const PCD_MFAUTHENT  = 0x0E;
-const PCD_SOFTRESET  = 0x0F;
-
-// ── PICC (Karte) Kommandos ──
-const PICC_REQA       = 0x26;
-const PICC_WUPA       = 0x52;
-const PICC_HALT       = 0x50;
-const PICC_SEL_CL1    = 0x93;
-const PICC_SEL_CL2    = 0x95;
-const PICC_ANTICOLL   = 0x20;
-const PICC_SELECT     = 0x70;
-const PICC_AUTH_KEY_A = 0x60;
-const PICC_READ       = 0x30;
-const PICC_WRITE      = 0xA0;
-
-// ── Register ──
-const CommandReg     = 0x01;
-const ComIEnReg      = 0x02;
-const ComIrqReg      = 0x04;
-const DivIrqReg      = 0x05;
-const ErrorReg       = 0x06;
-const Status2Reg     = 0x08;
-const FIFODataReg    = 0x09;
-const FIFOLevelReg   = 0x0A;
-const ControlReg     = 0x0C;
-const BitFramingReg  = 0x0D;
-const CollReg        = 0x0E;
-const ModeReg        = 0x11;
-const TxControlReg   = 0x14;
-const TxASKReg       = 0x15;
-const CRCResultRegH  = 0x21;
-const CRCResultRegL  = 0x22;
-const RFCfgReg       = 0x26;
-const TModeReg       = 0x2A;
-const TPrescalerReg  = 0x2B;
-const TReloadRegH    = 0x2C;
-const TReloadRegL    = 0x2D;
-
-// Register-Namen für Debug
-const REG_NAMES = {
-  0x01: "CommandReg", 0x02: "ComIEnReg", 0x04: "ComIrqReg",
-  0x05: "DivIrqReg", 0x06: "ErrorReg", 0x08: "Status2Reg",
-  0x09: "FIFODataReg", 0x0A: "FIFOLevelReg", 0x0C: "ControlReg",
-  0x0D: "BitFramingReg", 0x0E: "CollReg", 0x11: "ModeReg",
-  0x14: "TxControlReg", 0x15: "TxASKReg", 0x21: "CRCResultRegH",
-  0x22: "CRCResultRegL", 0x26: "RFCfgReg", 0x2A: "TModeReg",
-  0x2B: "TPrescalerReg", 0x2C: "TReloadRegH", 0x2D: "TReloadRegL",
-};
-
-function addrW(reg) { return (reg << 1) & 0x7E; }
-function addrR(reg) { return ((reg << 1) & 0x7E) | 0x80; }
-function hex(v) { return "0x" + (v & 0xFF).toString(16).padStart(2, "0"); }
-function hexArr(arr) { return arr.map(b => hex(b)).join(" "); }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function hexToBuf(h) {
-  const clean = String(h).trim().toLowerCase().replace(/[^0-9a-f]/g, "");
-  if (clean.length % 2 !== 0) throw new Error("hex string must have even length");
-  return Buffer.from(clean, "hex");
-}
-
-function ensure16Bytes(data) {
-  let buf = Buffer.isBuffer(data) ? Buffer.from(data) : hexToBuf(data);
-  if (buf.length > 16) buf = buf.subarray(0, 16);
-  if (buf.length < 16) {
-    const out = Buffer.alloc(16, 0x00);
-    buf.copy(out, 0);
-    buf = out;
+    return { error, backData, backBits, errReg };
   }
-  return buf;
-}
 
-class MFRC522 {
-  constructor(opts) {
-    this.bus     = Number(opts.bus     ?? 0);
-    this.device  = Number(opts.device  ?? 0);
-    this.speedHz = Number(opts.speedHz ?? 100_000);
-    this.antennaGain = Number(opts.antennaGain ?? 0x04); // 33 dB
-    this.debug   = Boolean(opts.debug ?? false);
-    this.dev     = null;
+  // ── PICC Operationen ──
 
-    this._stats = {
-      polls: 0,
-      requests: 0,
-      requestOk: 0,
-      requestFail: 0,
-      anticolls: 0,
-      anticollOk: 0,
-      anticollFail: 0,
-      cardWriteCalls: 0,
-      cardWriteErrors: 0,
-      cardWriteTimeouts: 0,
+  // request() — fragt ob eine Karte im Feld ist
+  async request(reqMode = PICC_REQA) {
+    this._stats.requests++;
+    await this.writeReg(BitFramingReg, 0x07);
+    const { error, backData, backBits } = await this.cardWrite(PCD_TRANSCEIVE, [reqMode]);
+
+    if (error || backBits !== 0x10) {
+      this._stats.requestFail++;
+      return null;
+    }
+    this._stats.requestOk++;
+    this._dbg(`request: ATQA=[${hexArr(backData)}]`);
+    return backData;
+  }
+
+  // anticoll() — liest UID (4 Bytes + BCC)
+  async anticoll(selCode = PICC_SEL_CL1) {
+    this._stats.anticolls++;
+    await this.writeReg(BitFramingReg, 0x00);
+    const { error, backData } = await this.cardWrite(PCD_TRANSCEIVE, [selCode, PICC_ANTICOLL]);
+
+    if (error || backData.length !== 5) {
+      this._stats.anticollFail++;
+      this._dbg(`anticoll(${hex(selCode)}): fehlgeschlagen, error=${error}, len=${backData.length}`);
+      return null;
+    }
+
+    let check = 0;
+    for (let i = 0; i < 4; i++) check ^= backData[i];
+    if (check !== backData[4]) {
+      this._stats.anticollFail++;
+      this._dbg(`anticoll(${hex(selCode)}): BCC falsch`);
+      return null;
+    }
+
+    this._stats.anticollOk++;
+    this._dbg(`anticoll(${hex(selCode)}): uid=[${hexArr(backData)}]`);
+    return backData;
+  }
+
+  // selectTag() — selektiert eine Karte (READY → ACTIVE)
+  // Wird im Normalpfad NICHT aufgerufen, nur bei Cascade (7-Byte-UID)
+  // oder wenn man danach Mifare-Blöcke lesen/schreiben will.
+  async selectTag(uid5, selCode = PICC_SEL_CL1) {
+    const buf = [selCode, PICC_SELECT];
+    for (let i = 0; i < 5; i++) buf.push(uid5[i]);
+    const crc = await this.calcCrc(buf);
+    buf.push(crc[0], crc[1]);
+
+    const { error, backData, backBits } = await this.cardWrite(PCD_TRANSCEIVE, buf);
+    const ok = !error && backBits === 0x18;
+    const sak = ok ? backData[0] : null;
+    this._dbg(`selectTag(${hex(selCode)}): ok=${ok} sak=${sak !== null ? hex(sak) : "null"}`);
+    return { ok, sak };
+  }
+
+  // readId() — liest die UID (4 oder 7 Bytes)
+  // Für 4-Byte-UIDs: nur anticoll, kein selectTag.
+  // Karte bleibt in READY — WUPA beim nächsten Poll spricht sie dort an.
+  // Für 7-Byte-UIDs: selectTag für CL1 nötig um CL2 zu lesen.
+  async readId() {
+    const uid1 = await this.anticoll(PICC_SEL_CL1);
+    if (!uid1) return null;
+
+    if (uid1[0] !== 0x88) {
+      // Normale 4-Byte-UID
+      return {
+        uid: uid1.slice(0, 4),
+        uidHex: uid1.slice(0, 4).map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
+      };
+    }
+
+    // Cascade: CL1 Select nötig um CL2 lesen zu können
+    this._dbg("readId: Cascade (uid1[0]=0x88), starte CL2...");
+
+    const sel1 = await this.selectTag(uid1, PICC_SEL_CL1);
+    if (!sel1.ok) {
+      this._dbg("readId: CL1 SELECT fehlgeschlagen");
+      return null;
+    }
+
+    const uid2 = await this.anticoll(PICC_SEL_CL2);
+    if (!uid2) {
+      this._dbg("readId: CL2 anticoll fehlgeschlagen");
+      return null;
+    }
+
+    const fullUid = [...uid1.slice(1, 4), ...uid2.slice(0, 4)];
+    return {
+      uid: fullUid,
+      uidHex: fullUid.map(b => (b & 0xFF).toString(16).padStart(2, "0")).join(""),
     };
   }
 
-  _dbg(...args) {
-    if (this.debug) console.log("[RC522:DBG]", ...args);
-  }
-
-  statsLine() {
-    const s = this._stats;
-    return `polls=${s.polls} req=${s.requestOk}/${s.requests} ` +
-           `anti=${s.anticollOk}/${s.anticolls} ` +
-           `cw=${s.cardWriteCalls}(err:${s.cardWriteErrors} to:${s.cardWriteTimeouts})`;
-  }
-
-  // ── SPI ──
-
-  open() {
-    if (this.dev) return;
-    this.dev = spi.openSync(this.bus, this.device, {
-      mode: 0,
-      maxSpeedHz: this.speedHz,
-    });
-  }
-
-  close() {
-    if (!this.dev) return;
-    try { this.dev.closeSync(); } catch {}
-    this.dev = null;
-  }
-
-  async _xfer(txBuf) {
-    return new Promise((resolve, reject) => {
-      const msg = [{
-        sendBuffer: txBuf,
-        receiveBuffer: Buffer.alloc(txBuf.length),
-        byteLength: txBuf.length,
-        speedHz: this.speedHz,
-      }];
-      this.dev.transfer(msg, (err, m) => {
-        if (err) return reject(err);
-        resolve(m[0].receiveBuffer);
-      });
-    });
-  }
-
-  async writeReg(reg, val) {
-    await this._xfer(Buffer.from([addrW(reg), val & 0xFF]));
-  }
-
-  async readReg(reg) {
-    const rx = await this._xfer(Buffer.from([addrR(reg), 0x00]));
-    return rx[1];
-  }
-
-  async setBitmask(reg, mask) {
-    const cur = await this.readReg(reg);
-    await this.writeReg(reg, cur | mask);
-  }
-
-  async clearBitmask(reg, mask) {
-    const cur = await this.readReg(reg);
-    await this.writeReg(reg, cur & ~mask);
-  }
-
-  async fifoWrite(data) {
-    for (let i = 0; i < data.length; i++) {
-      await this.writeReg(FIFODataReg, data[i]);
-    }
-  }
-
-  async fifoRead(n) {
-    const out = Buffer.alloc(n);
-    for (let i = 0; i < n; i++) {
-      out[i] = await this.readReg(FIFODataReg);
-    }
-    return out;
-  }
-
-  async hardwareReset() {
+  // halt() — Karte von ACTIVE nach HALT versetzen
+  // Wird im Normalpfad NICHT aufgerufen.
+  // Nur verfügbar für spezielle Anwendungsfälle.
+  async halt() {
     try {
-      // libgpiod v2 Syntax
-      execSync("gpioset -p 10ms -t0 /dev/gpiochip0 25=0", {
-        timeout: 3000,
-        stdio: "pipe",
-      });
-      execSync("gpioset -p 50ms -t0 /dev/gpiochip0 25=1", {
-        timeout: 3000,
-        stdio: "pipe",
-      });
+      const cmd = [PICC_HALT, 0x00];
+      const crc = await this.calcCrc(cmd);
+      cmd.push(crc[0], crc[1]);
+      await this.cardWrite(PCD_TRANSCEIVE, cmd);
+    } catch {}
+    try {
+      await this.clearBitmask(Status2Reg, 0x08);
+    } catch {}
+  }
 
-      await sleep(50);
-      console.log("RC522: Hardware-Reset GPIO 25 OK");
+  async stopCrypto() {
+    await this.clearBitmask(Status2Reg, 0x08);
+  }
+
+  // ── Mifare Operationen (benötigen vorheriges selectTag) ──
+
+  async mifareAuth(blockAddr, key6, uid4) {
+    const buf = [PICC_AUTH_KEY_A, blockAddr];
+    const keyArr = Buffer.isBuffer(key6) ? [...key6] : [...hexToBuf(key6)];
+    if (keyArr.length !== 6) throw new Error("Key must be 6 bytes");
+    buf.push(...keyArr);
+    for (let i = 0; i < 4; i++) buf.push(uid4[i]);
+
+    const { error } = await this.cardWrite(PCD_MFAUTHENT, buf);
+    const s2 = await this.readReg(Status2Reg);
+    if ((s2 & 0x08) === 0) return false;
+    return !error;
+  }
+
+  async mifareRead(blockAddr) {
+    const buf = [PICC_READ, blockAddr];
+    const crc = await this.calcCrc(buf);
+    buf.push(crc[0], crc[1]);
+    const { error, backData } = await this.cardWrite(PCD_TRANSCEIVE, buf);
+    if (error || backData.length !== 16) return null;
+    return Buffer.from(backData);
+  }
+
+  async mifareWrite(blockAddr, data16) {
+    const payload = ensure16Bytes(data16);
+    const cmd = [PICC_WRITE, blockAddr];
+    const crc1 = await this.calcCrc(cmd);
+    cmd.push(crc1[0], crc1[1]);
+    const res1 = await this.cardWrite(PCD_TRANSCEIVE, cmd);
+    if (res1.error || res1.backBits !== 4 || (res1.backData[0] & 0x0F) !== 0x0A) {
+      throw new Error("Write phase 1 failed");
+    }
+    const dataBuf = [...payload];
+    const crc2 = await this.calcCrc(dataBuf);
+    dataBuf.push(crc2[0], crc2[1]);
+    const res2 = await this.cardWrite(PCD_TRANSCEIVE, dataBuf);
+    if (res2.error || res2.backBits !== 4 || (res2.backData[0] & 0x0F) !== 0x0A) {
+      throw new Error("Write phase 2 failed");
+    }
+    return true;
+  }
+
+  // ── Hilfsfunktionen ──
+
+  static uidToHex(uid) {
+    const arr = Array.isArray(uid) ? uid : [...uid];
+    return arr.map(b => (b & 0xFF).toString(16).padStart(2, "0")).join("");
+  }
+
+  static bufToHex(buf) { return Buffer.from(buf).toString("hex"); }
+  static isTrailerBlock(b) { return (Number(b) % 4) === 3; }
+}
+
+module.exports = { MFRC522, ensure16Bytes, hexToBuf };
