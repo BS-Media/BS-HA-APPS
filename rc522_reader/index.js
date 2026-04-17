@@ -65,7 +65,7 @@ process.on("SIGINT", () => {
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
-  const removedMs = Math.max(100, Number(o.removed_ms ?? 800));
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 2000));
   const debugMode = Boolean(o.debug ?? false);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
@@ -73,7 +73,7 @@ process.on("SIGINT", () => {
   const maxErrorsBeforeRestart = 10;
   const statsLogInterval = 500;
   const heartbeatInterval = 50;
-  const idleRecoveryMissThreshold = Math.max(25, Math.ceil(5000 / pollMs));
+  const idleRecoveryMissThreshold = Math.max(50, Math.ceil(10000 / pollMs));
 
   let presentUid = null;
   let missCount = 0;
@@ -174,8 +174,16 @@ process.on("SIGINT", () => {
         await r.dumpState("periodic");
       }
 
-      const atqa = await r.request(0x52); // WUPA
+      let atqa = await r.request(0x52); // WUPA
       errorCount = 0;
+
+      // Ein einzelnes no-atqa kann eine kurze Funkluecke sein.
+      // Wenn bereits ein Tag praesent ist, probieren wir einmal sofort nach.
+      if (!atqa && presentUid) {
+        await sleep(30);
+        atqa = await r.request(0x52);
+        if (atqa) dbg("atqa recovered on retry", atqa);
+      }
 
       if (!atqa) {
         uidFailCount = 0;
