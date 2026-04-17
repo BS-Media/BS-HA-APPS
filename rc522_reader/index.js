@@ -10,7 +10,7 @@
  *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
  *
  * Kein halt(), kein antennaReset() im Normalpfad.
- * Reset (softReset + init) nur bei echten Reader-/SPI-Fehlern.
+ * Recovery nur gezielt bei echter Blindphase oder Reader-/SPI-Fehlern.
  */
 
 const fs = require("fs");
@@ -73,15 +73,36 @@ process.on("SIGINT", () => {
   const maxErrorsBeforeRestart = 10;
   const statsLogInterval = 500;
   const heartbeatInterval = 50;
+  const idleRecoveryMissThreshold = Math.max(25, Math.ceil(5000 / pollMs));
 
   let presentUid = null;
   let missCount = 0;
   let uidFailCount = 0;
   let errorCount = 0;
   let pollCount = 0;
+  let idleRecoveryDone = false;
 
   function dbg(...args) {
     if (debugMode) console.log("[MAIN:DBG]", ...args);
+  }
+
+  async function publishRemoved(now, reason) {
+    if (!presentUid) return;
+
+    client.publish(
+      `${topicBase}/removed`,
+      JSON.stringify({ event: "removed", uid: presentUid, ts: now, reason })
+    );
+    client.publish(
+      `${topicBase}/state`,
+      JSON.stringify({ present: false, uid: null, ts: now }),
+      { retain: true }
+    );
+    console.log("REMOVED", presentUid, `reason=${reason}`);
+
+    presentUid = null;
+    missCount = 0;
+    idleRecoveryDone = false;
   }
 
   const url = `mqtt://${o.mqtt_host}:${Number(o.mqtt_port || 1883)}`;
@@ -162,111 +183,18 @@ process.on("SIGINT", () => {
         dbg("no atqa", { missCount, presentUid });
 
         if (presentUid && missCount >= maxMissesBeforeRemoved) {
-          client.publish(
-            `${topicBase}/removed`,
-            JSON.stringify({ event: "removed", uid: presentUid, ts: now })
-          );
-          client.publish(
-            `${topicBase}/state`,
-            JSON.stringify({ present: false, uid: null, ts: now }),
-            { retain: true }
-          );
-          console.log("REMOVED", presentUid);
-          presentUid = null;
-          missCount = 0;
-
-          // Nur kurze Ruhezeit, kein halt(), kein antennaReset()
-          await sleep(300);
+          await publishRemoved(now, "no-atqa");
         }
 
-        await sleep(pollMs);
-        continue;
-      }
-
-      dbg("atqa ok", atqa);
-
-      missCount = 0;
-
-      const idResult = await r.readId();
-
-      if (!idResult) {
-        uidFailCount++;
-        dbg("atqa ok, readId failed", { uidFailCount });
-
-        if (uidFailCount >= maxUidFailsBeforeReInit) {
+        if (!presentUid && !idleRecoveryDone && missCount >= idleRecoveryMissThreshold) {
+          idleRecoveryDone = true;
           console.warn(
-            `RC522: ${maxUidFailsBeforeReInit}x UID-Lesung fehlgeschlagen → Re-Init`
+            `RC522: ${missCount} Misses ohne Tag → gezielte Idle-Recovery`
           );
           try {
             await r.softReset();
             await r.init();
-            console.log("RC522: Re-Init nach UID-Fehler erfolgreich");
+            missCount = 0;
+            console.log("RC522: Idle-Recovery erfolgreich");
           } catch (e) {
-            console.error("RC522: Re-Init fehlgeschlagen:", e?.message);
-          }
-          uidFailCount = 0;
-        }
-
-        await sleep(pollMs);
-        continue;
-      }
-
-      uidFailCount = 0;
-
-      const uid = idResult.uidHex;
-      dbg("readId ok", { uid });
-
-      if (uid !== presentUid) {
-        presentUid = uid;
-
-        client.publish(
-          `${topicBase}/present`,
-          JSON.stringify({ event: "present", uid, ts: now })
-        );
-        client.publish(
-          `${topicBase}/state`,
-          JSON.stringify({ present: true, uid, ts: now }),
-          { retain: true }
-        );
-        console.log("PRESENT", uid);
-      }
-
-      // bewusst kein halt()
-      // bewusst kein antennaReset() im Normalpfad
-
-    } catch (e) {
-      errorCount++;
-
-      console.error(
-        `RC522 loop Fehler ${errorCount}/${maxErrorsBeforeRestart} auf ` +
-        `/dev/spidev${spiBus}.${spiDevice}: ${e?.stack || e?.message || e}`
-      );
-
-      if (debugMode) {
-        await r.dumpState("error");
-      }
-
-      if (errorCount >= maxErrorsBeforeRestart) {
-        console.error("RC522 antwortet nicht mehr — erzwinge Neustart...");
-        if (r._stats) console.log(`[STATS:FINAL] ${r.statsLine()}`);
-        process.exit(1);
-      }
-
-      if (errorCount >= 3) {
-        try {
-          console.log("RC522: Versuche Soft-Reset + Re-Init...");
-          await r.softReset();
-          await r.init();
-          console.log("RC522: Re-Init erfolgreich");
-          errorCount = 0;
-        } catch (reinitErr) {
-          console.error("RC522: Re-Init fehlgeschlagen:", reinitErr?.message);
-        }
-      }
-
-      await sleep(500);
-    }
-
-    await sleep(pollMs);
-  }
-})();
+            console.error("RC522: Idle-Recovery fehlgeschlagen:", e?.message);
