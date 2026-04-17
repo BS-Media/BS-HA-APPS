@@ -199,6 +199,7 @@ class MFRC522 {
       await sleep(50);
       console.log("RC522: Hardware-Reset GPIO 25 OK");
     } catch (e1) {
+      console.warn("RC522: GPIO Reset v2 fehlgeschlagen:", e1?.message || e1);
       try {
         // Fallback fuer aeltere libgpiod-Versionen
         execSync("gpioset -m time -u 10000 /dev/gpiochip0 25=0", {
@@ -218,6 +219,7 @@ class MFRC522 {
       }
     }
   }
+
 
   // ── Init ──
 
