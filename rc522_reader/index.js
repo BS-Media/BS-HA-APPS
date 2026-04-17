@@ -65,11 +65,7 @@ process.on("SIGINT", () => {
 
   const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
   const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
-  const configuredRemovedMs = Number(o.removed_ms ?? 2000);
-  const removedMs = Math.max(
-    100,
-    configuredRemovedMs === 800 ? 2000 : configuredRemovedMs
-  );
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 2000));
   const debugMode = Boolean(o.debug ?? false);
 
   const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
@@ -89,12 +85,6 @@ process.on("SIGINT", () => {
 
   function dbg(...args) {
     if (debugMode) console.log("[MAIN:DBG]", ...args);
-  }
-
-  if (configuredRemovedMs === 800) {
-    console.warn(
-      "RC522: Legacy removed_ms=800 erkannt — verwende 2000ms fuer stabileren Betrieb"
-    );
   }
 
   async function publishRemoved(now, reason) {
