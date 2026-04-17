@@ -1,3 +1,103 @@
+/**
+ * RC522 Reader Add-on (Home Assistant)
+ *
+ * Liest RC522/MFRC522 per SPI und publiziert Events per MQTT.
+ * Basierend auf pi-rc522 (ondryaso) — portiert nach Node.js.
+ * Kein IRQ nötig — reiner Polling-Modus.
+ *
+ * Ablauf pro Poll:
+ *   1. request(WUPA) → ist eine Karte da?
+ *   2. readId()      → UID lesen (CL1, bei Cascade auch CL2)
+ *
+ * Kein halt(), kein antennaReset() im Normalpfad.
+ * Recovery nur gezielt bei echter Blindphase oder Reader-/SPI-Fehlern.
+ */
+
+const fs = require("fs");
+const mqtt = require("mqtt");
+const { MFRC522 } = require("./lib/mfrc522");
+
+const OPT_PATH = "/data/options.json";
+
+function loadOptions() {
+  const raw = fs.readFileSync(OPT_PATH, "utf8");
+  return JSON.parse(raw);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Diagnose: sichtbar machen, falls der Prozess extern beendet oder intern crasht
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err?.stack || err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err?.stack || err);
+});
+
+process.on("exit", (code) => {
+  console.error("PROCESS EXIT with code:", code);
+});
+
+process.on("SIGTERM", () => {
+  console.error("PROCESS GOT SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  console.error("PROCESS GOT SIGINT");
+});
+
+(async () => {
+  const o = loadOptions();
+
+  const spiPath = String(o.spi_path || "").trim();
+  let spiBus = Number(o.spi_bus ?? 0);
+  let spiDevice = Number(o.spi_device ?? 0);
+
+  if (spiPath) {
+    const match = spiPath.match(/^\/dev\/spidev(\d+)\.(\d+)$/);
+    if (!match) throw new Error(`Ungültiger spi_path: ${spiPath}`);
+    spiBus = Number(match[1]);
+    spiDevice = Number(match[2]);
+  }
+
+  const topicBase = String(o.topic_base || "rfid/rc522").replace(/\/+$/, "");
+  const pollMs = Math.max(50, Number(o.poll_ms ?? 200));
+  const removedMs = Math.max(100, Number(o.removed_ms ?? 800));
+  const debugMode = Boolean(o.debug ?? false);
+
+  const maxMissesBeforeRemoved = Math.max(2, Math.ceil(removedMs / pollMs));
+  const maxUidFailsBeforeReInit = 8;
+  const maxErrorsBeforeRestart = 10;
+  const statsLogInterval = 500;
+  const heartbeatInterval = 50;
+  const idleRecoveryMissThreshold = Math.max(25, Math.ceil(5000 / pollMs));
+
+  let presentUid = null;
+  let missCount = 0;
+  let uidFailCount = 0;
+  let errorCount = 0;
+  let pollCount = 0;
+  let idleRecoveryDone = false;
+
+  function dbg(...args) {
+    if (debugMode) console.log("[MAIN:DBG]", ...args);
+  }
+
+  async function publishRemoved(now, reason) {
+    if (!presentUid) return;
+
+    client.publish(
+      `${topicBase}/removed`,
+      JSON.stringify({ event: "removed", uid: presentUid, ts: now, reason })
+    );
+    client.publish(
+      `${topicBase}/state`,
+      JSON.stringify({ present: false, uid: null, ts: now }),
+      { retain: true }
+    );
     console.log("REMOVED", presentUid, `reason=${reason}`);
 
     presentUid = null;
